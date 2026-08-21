@@ -119,11 +119,14 @@ def static_of(address, module_list):
     return None
 
 
-def find_paths(process, target, depth, max_offset, max_paths):
+def find_paths(process, target, depth, max_offset, max_paths, max_frontier=200000):
     pmap = PointerMap(process)
     module_list = modules(process.pid)
     results = []
-    # Each frontier item: (current_address, [offsets from here down to target], seen set)
+    # Each frontier item: (current_address, [offsets from here down to target], seen set).
+    # The frontier is the part that grows: every non-static holder found spawns a node next
+    # level, so on a big target the level-by-level expansion, not the results list, is what
+    # runs away. Cap it, widest-first, so the scan stays bounded regardless of depth/offset.
     frontier = [(target, [], {target})]
     for _level in range(depth):
         nxt = []
@@ -137,7 +140,7 @@ def find_paths(process, target, depth, max_offset, max_paths):
                     results.append((static[0], static[1], chain))
                     if len(results) >= max_paths:
                         return results, pmap
-                else:
+                elif len(nxt) < max_frontier:
                     nxt.append((holder, chain, seen | {holder}))
         frontier = nxt
         if not frontier:

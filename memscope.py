@@ -136,7 +136,12 @@ class Process:
             base, size = info.BaseAddress, info.RegionSize
             if size == 0:
                 break
-            if (info.State == MEM_COMMIT and info.Protect in WRITABLE
+            # Protect carries the base protection in its low byte with modifier flags above
+            # it (PAGE_GUARD 0x100, PAGE_NOCACHE 0x200, PAGE_WRITECOMBINE 0x400). Mask to the
+            # low byte before the membership test, or a writable page tagged NOCACHE or
+            # WRITECOMBINE is missed; and still exclude guard pages, which raise when read.
+            base_protect = info.Protect & 0xFF
+            if (info.State == MEM_COMMIT and base_protect in WRITABLE
                     and not (info.Protect & PAGE_GUARD)):
                 yield base, size
             address = base + size
@@ -214,23 +219,36 @@ class Scanner:
         return found
 
     def snapshot(self):
-        """Record every candidate's current value, for narrowing by movement later."""
+        """Record every candidate's current value, for narrowing by movement later.
+
+        Returns (values, truncated). `truncated` is True when the MAX_HITS cap was hit and
+        the rest of the address space was not recorded -- the caller should say so, or the
+        tool looks like it searched everything when it did not.
+        """
         _, size = TYPES[self.kind]
         current = {}
+        scanned = 0
+        truncated = False
         for base, region in self.process.regions():
             offset = 0
             while offset < region:
                 span = min(4 * 1024 * 1024, region - offset)
                 data = self.process.read(base + offset, span)
                 if data:
+                    scanned += len(data)
                     for at in range(0, len(data) - size + 1, size):
-                        value = unpack(data[at:at + size], self.kind)
-                        current[base + offset + at] = value
+                        current[base + offset + at] = unpack(data[at:at + size], self.kind)
                         if len(current) >= MAX_HITS:
+                            truncated = True
                             break
                 offset += span
+                if truncated or scanned >= MAX_SCAN_BYTES:
+                    truncated = truncated or scanned >= MAX_SCAN_BYTES
+                    break
+            if truncated:
+                break
         self.candidates = current
-        return current
+        return current, truncated
 
     def refresh(self):
         """Re-read the current value at each candidate address."""
@@ -303,7 +321,16 @@ def repl(scanner):
 
         if command in ("quit", "exit", "q"):
             break
-        elif command == "help":
+        try:
+            _dispatch(scanner, command, rest, frozen)
+        except (ValueError, IndexError, OSError) as problem:
+            # A bad argument (write zzz 5) should not end the session and throw away a
+            # candidate set that took real time to narrow. Report it and keep going.
+            print("  error: %s" % problem)
+
+
+def _dispatch(scanner, command, rest, frozen):
+        if command == "help":
             print(__doc__[__doc__.index("Inside the scanner"):])
         elif command == "type":
             try:
@@ -318,9 +345,10 @@ def repl(scanner):
                 print("%d addresses hold %s" % (len(found), rest[0]))
             else:
                 print("snapshotting memory to narrow by movement...")
-                found = scanner.snapshot()
-                print("%d values recorded; change the value in the program, then `next up`, "
-                      "`next down`, `next changed` or `next same`" % len(found))
+                found, truncated = scanner.snapshot()
+                note = "  (capped at %d -- the rest of memory was not recorded)" % MAX_HITS if truncated else ""
+                print("%d values recorded%s; change the value in the program, then `next up`, "
+                      "`next down`, `next changed` or `next same`" % (len(found), note))
         elif command == "next":
             if scanner.candidates is None:
                 print("scan first")
@@ -337,15 +365,20 @@ def repl(scanner):
                 print("no candidates")
             else:
                 limit = int(rest[0]) if rest else 20
-                current = scanner.refresh()
-                for address in list(scanner.candidates)[:limit]:
-                    print("  0x%X = %s" % (address, current.get(address)))
+                # Re-read only the rows about to be printed, not the whole candidate set --
+                # after a bare `scan` that set can be millions of addresses.
+                _, size = TYPES[scanner.kind]
+                shown = list(scanner.candidates)[:limit]
+                for address in shown:
+                    data = scanner.process.read(address, size)
+                    value = unpack(data, scanner.kind) if data is not None else "<unreadable>"
+                    print("  0x%X = %s" % (address, value))
                 if len(scanner.candidates) > limit:
                     print("  ... %d more" % (len(scanner.candidates) - limit))
         elif command == "write":
             if len(rest) < 2:
                 print("write <addr> <value>")
-                continue
+                return
             address = int(rest[0], 16)
             before = unpack(scanner.process.read(address, TYPES[scanner.kind][1]) or b"", scanner.kind)
             answer = input("  0x%X is %s, write %s? [y/N] " % (address, before, rest[1]))
@@ -355,7 +388,7 @@ def repl(scanner):
         elif command == "freeze":
             if len(rest) < 2:
                 print("freeze <addr> <value>   (blank line re-applies all freezes; `unfreeze` clears)")
-                continue
+                return
             address = int(rest[0], 16)
             frozen[address] = (rest[1], scanner.kind)
             scanner.process.write(address, pack(rest[1], scanner.kind))
@@ -366,12 +399,12 @@ def repl(scanner):
         elif command == "pscan":
             if not rest:
                 print("pscan <addr> [depth] [max_offset_hex]  -- find static pointer paths")
-                continue
+                return
             try:
                 import ptrscan
             except ImportError:
                 print("ptrscan.py not found next to memscope.py")
-                continue
+                return
             target = int(rest[0], 16)
             depth = int(rest[1]) if len(rest) > 1 else 3
             max_offset = int(rest[2], 16) if len(rest) > 2 else 0x400
