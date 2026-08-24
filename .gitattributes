@@ -1,0 +1,8 @@
+# Windows batch files keep CRLF wherever they are checked out or archived.
+#
+# Not for a failure that was seen: an LF-only copy of sas4.bat was run on Windows 11 and
+# worked, nested for/if blocks and all. The reason is that this repo is downloaded two ways
+# -- GitHub's generated source archive, and the release asset built by make_dist.py -- and
+# without this the .bat files are the only thing that differs between them. Two downloads
+# that are supposed to be the same thing should be the same thing.
+*.bat text eol=crlf
