@@ -78,6 +78,7 @@ class PointerMap:
         self.region_bounds = []                   # sorted (base, end), to test plausibility
         self.values = []                          # sorted pointer values
         self.addrs = []                           # address holding each value (parallel)
+        self.truncated = False                    # True when a cap stopped the walk early
         self._build()
 
     def _plausible(self, value):
@@ -85,22 +86,37 @@ class PointerMap:
         return i >= 0 and self.region_bounds[i][0] <= value < self.region_bounds[i][1]
 
     def _build(self):
+        """Walk every region once, keeping the slots that hold a plausible pointer.
+
+        Both caps have to stop the whole walk, not just the chunk being unpacked: an
+        inner-loop-only break keeps reading the rest of the address space and adds a pair
+        per chunk, so the map looks complete when it is not. `truncated` records that it
+        stopped early, so the caller can say the map was capped.
+        """
         regions = list(self.process.regions())
         self.region_bounds = sorted((base, base + size) for base, size in regions)
         pairs = []
+        scanned = 0
         for base, size in regions:
             offset = 0
             while offset < size:
                 span = min(4 * 1024 * 1024, size - offset)
                 data = self.process.read(base + offset, span)
                 if data:
+                    scanned += len(data)
                     for at in range(0, len(data) - PTR + 1, PTR):
                         value = int.from_bytes(data[at:at + PTR], "little")
                         if self._plausible(value):
                             pairs.append((value, base + offset + at))
-                        if len(pairs) >= memscope.MAX_HITS:
-                            break
+                            if len(pairs) >= memscope.MAX_HITS:
+                                self.truncated = True
+                                break
                 offset += span
+                if self.truncated or scanned >= memscope.MAX_SCAN_BYTES:
+                    self.truncated = True
+                    break
+            if self.truncated:
+                break
         pairs.sort()
         self.values = [v for v, _a in pairs]
         self.addrs = [a for _v, a in pairs]
@@ -112,6 +128,17 @@ class PointerMap:
         return [(self.addrs[i], target - self.values[i]) for i in range(lo, hi)]
 
 
+def scan_limits(pmap, dropped):
+    """Lines naming any cap that bounded the scan, so it does not look exhaustive."""
+    notes = []
+    if pmap.truncated:
+        notes.append("  (pointer map capped at %d slots -- part of memory was not mapped)"
+                     % memscope.MAX_HITS)
+    if dropped:
+        notes.append("  (frontier capped -- %d branch(es) were not explored)" % dropped)
+    return notes
+
+
 def static_of(address, module_list):
     for name, base, size in module_list:
         if base <= address < base + size:
@@ -120,9 +147,15 @@ def static_of(address, module_list):
 
 
 def find_paths(process, target, depth, max_offset, max_paths, max_frontier=200000):
+    """Static pointer paths to `target`.
+
+    Returns (results, pmap, dropped). `dropped` counts the holders the frontier cap left
+    unexplored, so the caller can say the search was bounded rather than exhaustive.
+    """
     pmap = PointerMap(process)
     module_list = modules(process.pid)
     results = []
+    dropped = 0
     # Each frontier item: (current_address, [offsets from here down to target], seen set).
     # The frontier is the part that grows: every non-static holder found spawns a node next
     # level, so on a big target the level-by-level expansion, not the results list, is what
@@ -139,13 +172,15 @@ def find_paths(process, target, depth, max_offset, max_paths, max_frontier=20000
                 if static:
                     results.append((static[0], static[1], chain))
                     if len(results) >= max_paths:
-                        return results, pmap
+                        return results, pmap, dropped
                 elif len(nxt) < max_frontier:
                     nxt.append((holder, chain, seen | {holder}))
+                else:
+                    dropped += 1
         frontier = nxt
         if not frontier:
             break
-    return results, pmap
+    return results, pmap, dropped
 
 
 def resolve(process, module_name, module_offset, offsets, module_list):
@@ -208,8 +243,12 @@ def main():
         max_offset = int(args.offset, 16)
         print("scanning for static pointer paths to 0x%X (depth %d, max offset 0x%X)..."
               % (target, args.depth, max_offset))
-        results, pmap = find_paths(process, target, args.depth, max_offset, args.max)
-        print("mapped %d pointers; found %d path(s)\n" % (len(pmap.values), len(results)))
+        results, pmap, dropped = find_paths(process, target, args.depth, max_offset,
+                                            args.max)
+        print("mapped %d pointers; found %d path(s)" % (len(pmap.values), len(results)))
+        for note in scan_limits(pmap, dropped):
+            print(note)
+        print()
         for module_name, module_offset, offsets in results:
             address = resolve(process, module_name, module_offset, offsets, module_list)
             ok = "ok" if address == target else "-> 0x%X" % address if address else "stale"

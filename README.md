@@ -86,6 +86,27 @@ printed as `module+offset -> offset -> ...` and verified by resolving it back to
 It reads every pointer-sized slot in the process once, so it is heavier than a value scan --
 start with a small depth and offset, and mind free RAM on a large target.
 
+## Tests
+
+```
+py tests/selftest.py                   the offline checks
+py tests/selftest.py --pid <pid|name>  and the same checks against a live process
+```
+
+The offline half needs nothing: it runs against a byte-backed fake process, and covers the
+page arithmetic behind `refresh()` (against the one-read-per-address version it replaced,
+across every type, both sides of every page boundary, values hanging over the end, and
+unreadable pages), the caps in `PointerMap._build` and `find_paths`, and every exception
+`pack()` can raise.
+
+`--pid` repeats those against real memory, where pages that genuinely will not read exercise
+a fallback a fake can only simulate, and measures the `_build` cap against the shape it
+replaced. It reads the target and never writes to it. Point it at a 64-bit process if you
+want the pointer-map checks: `ptrscan` assumes 8-byte pointers, so against a 32-bit target
+they would measure nothing, and they are skipped rather than run and believed.
+
+Windows only, like the rest of this: `memscope.py` binds `kernel32` at import.
+
 ## Status
 
 The scan / narrow / write engine is tested end to end against a target process holding a

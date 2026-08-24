@@ -66,6 +66,7 @@ ALIASES = {"int": "int32", "uint": "uint32", "long": "int64", "byte": "uint8", "
 
 MAX_SCAN_BYTES = 3 * 1024 * 1024 * 1024
 MAX_HITS = 2_000_000
+PAGE = 4096                                      # the unit refresh() re-reads in
 
 
 class MEMORY_BASIC_INFORMATION64(ctypes.Structure):
@@ -251,10 +252,29 @@ class Scanner:
         return current, truncated
 
     def refresh(self):
-        """Re-read the current value at each candidate address."""
+        """Re-read the current value at each candidate address, a page at a time.
+
+        One ReadProcessMemory per candidate is a syscall per address, and after a bare
+        `scan` the candidate set is MAX_HITS entries by construction -- so the first
+        `next` was millions of syscalls. Candidates come out of a scan in ascending
+        address order, so holding one page and reusing it collapses that to roughly one
+        read per 4 KB touched, with no index to build.
+
+        Two cases fall back to a single read, so the result is identical to reading every
+        address on its own: a value that straddles the end of the page, and a page that
+        will not read in bulk (one unreadable page inside it must not drop the rest).
+        """
+        _, size = TYPES[self.kind]
         out = {}
+        page_base, page_data = None, None
         for address in self.candidates:
-            _, size = TYPES[self.kind]
+            base = address & ~(PAGE - 1)
+            if base != page_base:
+                page_base, page_data = base, self.process.read(base, PAGE)
+            at = address - base
+            if page_data is not None and at + size <= len(page_data):
+                out[address] = unpack(page_data[at:at + size], self.kind)
+                continue
             data = self.process.read(address, size)
             if data is not None:
                 out[address] = unpack(data, self.kind)
@@ -323,9 +343,12 @@ def repl(scanner):
             break
         try:
             _dispatch(scanner, command, rest, frozen)
-        except (ValueError, IndexError, OSError) as problem:
+        except (ValueError, IndexError, OSError, struct.error) as problem:
             # A bad argument (write zzz 5) should not end the session and throw away a
             # candidate set that took real time to narrow. Report it and keep going.
+            # struct.error does not inherit from ValueError, so an in-range-for-python but
+            # out-of-range-for-the-type value (write <addr> 99999999999 at int32) reaches
+            # here through pack() and needs naming separately.
             print("  error: %s" % problem)
 
 
@@ -381,17 +404,22 @@ def _dispatch(scanner, command, rest, frozen):
                 return
             address = int(rest[0], 16)
             before = unpack(scanner.process.read(address, TYPES[scanner.kind][1]) or b"", scanner.kind)
+            payload = pack(rest[1], scanner.kind)
             answer = input("  0x%X is %s, write %s? [y/N] " % (address, before, rest[1]))
             if answer.strip().lower() == "y":
-                ok = scanner.process.write(address, pack(rest[1], scanner.kind))
+                ok = scanner.process.write(address, payload)
                 print("  written" if ok else "  write failed")
         elif command == "freeze":
             if len(rest) < 2:
                 print("freeze <addr> <value>   (blank line re-applies all freezes; `unfreeze` clears)")
                 return
             address = int(rest[0], 16)
+            # Pack before recording: the blank-line replay below re-packs every frozen
+            # entry outside the try, so storing a value that cannot pack turns one bad
+            # argument into a crash on the next Enter, long after the command that caused it.
+            payload = pack(rest[1], scanner.kind)
             frozen[address] = (rest[1], scanner.kind)
-            scanner.process.write(address, pack(rest[1], scanner.kind))
+            scanner.process.write(address, payload)
             print("  freezing 0x%X at %s; press Enter to re-apply, `unfreeze` to stop" % (address, rest[1]))
         elif command == "unfreeze":
             frozen.clear()
@@ -410,9 +438,12 @@ def _dispatch(scanner, command, rest, frozen):
             max_offset = int(rest[2], 16) if len(rest) > 2 else 0x400
             print("scanning for static pointer paths (depth %d, offset 0x%X)..."
                   % (depth, max_offset))
-            results, pmap = ptrscan.find_paths(scanner.process, target, depth, max_offset, 40)
+            results, pmap, dropped = ptrscan.find_paths(scanner.process, target, depth,
+                                                        max_offset, 40)
             module_list = ptrscan.modules(scanner.process.pid)
             print("mapped %d pointers, %d path(s):" % (len(pmap.values), len(results)))
+            for note in ptrscan.scan_limits(pmap, dropped):
+                print(note)
             for module_name, module_offset, offsets in results:
                 addr = ptrscan.resolve(scanner.process, module_name, module_offset, offsets, module_list)
                 ok = "ok" if addr == target else "stale"
