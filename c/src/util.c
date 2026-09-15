@@ -7,58 +7,125 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 bool ms_parse_hex_u64(const char *s, bool reject_negative, uint64_t *out) {
+    /* One line, on purpose. This used to be a second implementation of the sign, prefix and
+     * overflow handling in ms_parse_py_int below, and the two drifted: a fix to one did not
+     * reach the other. The contract is unchanged -- base 16, no error text, no
+     * arbitrary-precision fallback -- so every existing caller is unaffected, and there is
+     * now one place where a sign or overflow bug can live. */
     if (!s) {
         return false;
     }
-    while (isspace((unsigned char)*s)) {
-        s++;
+    return ms_parse_py_int(s, 16, reject_negative, out, NULL, NULL, 0);
+}
+
+/* Parses `s` the way Python's `int(s, base)` does for base 10 or 16 (the only two bases this
+ * REPL ever calls it with -- `list`'s count and `write`/`freeze`/`pscan`'s addresses and
+ * `pscan`'s own depth/offset): optional surrounding whitespace, an optional sign, an optional
+ * "0x"/"0X" prefix when base is 16, then one or more digits of that base and nothing else. On
+ * failure, writes a message shaped like CPython's ValueError text into `err` and returns false,
+ * leaving `*out` untouched.
+ *
+ * Unlike Python's int(), a magnitude that does not fit in 64 bits is also reported as failure
+ * (ERANGE from strtoull) UNLESS the caller passes a non-NULL `overflow`, in which case it is
+ * filled in instead and this returns false only in the sense of "no 64-bit value exists" --
+ * the caller decides what that means (list treats it as "all of them" or "none of them" with
+ * an exact decimal tally; pscan's depth and offset treat it as unbounded, since a BFS this
+ * shallow always terminates on its own long before either value could matter). Passing NULL
+ * for `overflow` means the caller has no such fallback and every magnitude out of range is an
+ * ordinary parse error -- `write`, `freeze` and `pscan`'s own target address use this, since
+ * silently retargeting any of them, as an earlier version of this function did by saturating,
+ * is worse than refusing outright.
+ *
+ * `reject_negative`, when true, fails a negative literal outright with the same wording
+ * Python's repl_address() raises for the identical case -- rather than the two's-complement
+ * wrap this function would otherwise produce, which is exactly right for `list`'s count (a
+ * negative count is a real, meaningful value to Python) and exactly wrong for an address
+ * (`write -1 5` must not silently write to 0xFFFFFFFFFFFFFFFF). */
+bool ms_parse_py_int(const char *s, int base, bool reject_negative, uint64_t *out,
+                          MsIntOverflow *overflow, char *err, size_t err_cap) {
+    if (overflow) {
+        overflow->triggered = false;
     }
-    if (*s == '\0') {
-        return false;
+    const char *start = s;
+    while (*start && isspace((unsigned char)*start)) {
+        start++;
     }
+    const char *end = start + strlen(start);
+    while (end > start && isspace((unsigned char)end[-1])) {
+        end--;
+    }
+
+    const char *p = start;
     bool neg = false;
-    const char *digits = s;
-    if (*digits == '-') {
-        /* strtoull would otherwise accept this itself and wrap the magnitude into a huge
-         * unsigned value on its own -- the same hazard class the ERANGE saturation bug this
-         * review round was dispatched over was, and it is what let `ptrscan --offset -1`
-         * turn an intended no-op into an effectively unbounded scan. Handling the sign here
-         * ourselves, rather than letting strtoull do it, is what lets a caller that wants a
-         * negative literal (a --resolve path's hop offsets) get one on purpose instead of by
-         * accident, while a caller that must never see one (every address this port parses)
-         * can still refuse it outright. */
-        if (reject_negative) {
-            return false;
+    if (p < end && (*p == '+' || *p == '-')) {
+        neg = (*p == '-');
+        p++;
+    }
+    if (base == 16 && end - p >= 2 && p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
+        p += 2;
+    }
+
+    bool any_digit = false;
+    for (const char *q = p; q < end; q++) {
+        int ok = (base == 16) ? isxdigit((unsigned char)*q) : isdigit((unsigned char)*q);
+        if (!ok) {
+            any_digit = false;
+            break;
         }
-        neg = true;
-        digits++;
+        any_digit = true;
     }
-    char *end = NULL;
+    if (!any_digit || p >= end) {
+        if (err) {
+            snprintf(err, err_cap, "invalid literal for int() with base %d: '%s'", base, s);
+        }
+        return false;
+    }
+
+    char digits[128];
+    size_t len = (size_t)(end - p);
+    if (len >= sizeof(digits)) {
+        if (err) {
+            snprintf(err, err_cap, "invalid literal for int() with base %d: '%s'", base, s);
+        }
+        return false;
+    }
+    memcpy(digits, p, len);
+    digits[len] = '\0';
+
+    if (reject_negative && neg) {
+        if (err) {
+            snprintf(err, err_cap, "int too large to convert: '%s'", s);
+        }
+        return false;
+    }
+
+    char *stop;
     errno = 0;
-    unsigned long long v = strtoull(digits, &end, 16);
-    if (end == digits) {
+    unsigned long long magnitude = strtoull(digits, &stop, base);
+    if (*stop != '\0') {
+        if (err) {
+            snprintf(err, err_cap, "invalid literal for int() with base %d: '%s'", base, s);
+        }
         return false;
     }
-    while (isspace((unsigned char)*end)) {
-        end++;
-    }
-    /* A magnitude too large for uint64_t is rejected outright (errno == ERANGE). Python's
-     * int(s, 16) has arbitrary precision and accepts a value like this; it is only later,
-     * when the value is boxed into a ctypes.c_void_p for the actual ReadProcessMemory call,
-     * that ctypes silently masks it down to its low 64 bits -- the exact "different address
-     * than typed" hazard this function exists to avoid, just deferred a few lines. Rejecting
-     * here instead of guessing at a truncation is the better of the two behaviours. */
-    if (*end != '\0' || errno == ERANGE) {
+    if (errno == ERANGE) {
+        if (overflow) {
+            overflow->triggered = true;
+            overflow->negative = neg;
+            snprintf(overflow->magnitude, sizeof(overflow->magnitude), "%s", digits);
+        }
+        if (err) {
+            snprintf(err, err_cap, "int too large to convert: '%s'", s);
+        }
         return false;
     }
-    /* A negative literal is encoded as its two's-complement bit pattern: ordinary unsigned
-     * addition against it (as ptrpath_resolve does for every hop) reproduces exactly the
-     * same 64-bit result as Python's real signed subtraction would. */
-    *out = neg ? (uint64_t)(-(long long)v) : (uint64_t)v;
+
+    *out = neg ? (uint64_t)(-(long long)magnitude) : (uint64_t)magnitude;
     return true;
 }
 
@@ -121,4 +188,17 @@ bool ms_looks_like_negative_number(const char *s) {
         }
     }
     return seen_digit;
+}
+
+int ms_strip_dashdash(int *argc, char **argv) {
+    for (int i = 0; i < *argc; i++) {
+        if (strcmp(argv[i], "--") == 0) {
+            for (int j = i; j + 1 < *argc; j++) {
+                argv[j] = argv[j + 1];
+            }
+            (*argc)--;
+            return i;
+        }
+    }
+    return *argc;
 }

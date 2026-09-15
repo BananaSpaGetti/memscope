@@ -516,10 +516,67 @@ def test_parser_errors(pid, addrs):
             py_memscope("read", pid, "--count"), c_memscope("read", pid, "--count"))
     compare("memscope read --type with no value",
             py_memscope("read", pid, "--type"), c_memscope("read", pid, "--type"))
-    # A negative address only reaches memscope.py's read/dump at all via argparse's `--`
-    # end-of-options separator, which this hand-rolled C parser does not implement -- so
-    # this defense-in-depth fix (finding #9) is verified at the unit level instead of
-    # here; see MemScope/c/tests/test_util.c and the direct repl_address()/range checks.
+    # argparse's `--` end-of-options separator, which the C parser now implements at every
+    # level it exists at: memscope's top level, each of its subcommands, and ptrscan's single
+    # parser. It was left out of an earlier round, which is why the negative-address fix it
+    # gates could only be checked at the unit level; these cover it end to end.
+    #
+    # Three parts of it are easy to get wrong and each has a case here:
+    #   - only the FIRST `--` is consumed; a second is a literal positional
+    #   - a --help AFTER the separator is not help, it is a positional
+    #   - the separator belongs to whichever parser level is reading when it appears, so a
+    #     `--` after the subcommand name is the subparser's, not the top level's
+    compare("memscope read -- then positionals",
+            py_memscope("read", "--", pid, addr), c_memscope("read", "--", pid, addr))
+    compare("memscope read positional then -- then positional",
+            py_memscope("read", pid, "--", addr), c_memscope("read", pid, "--", addr))
+    compare("memscope read -- then a negative address",
+            py_memscope("read", "--", "-5", addr), c_memscope("read", "--", "-5", addr))
+    compare("memscope read -- then --help is not help",
+            py_memscope("read", "--", "--help"), c_memscope("read", "--", "--help"))
+    compare("memscope read --help before -- is still help",
+            py_memscope("read", "--help", "--", pid),
+            c_memscope("read", "--help", "--", pid))
+    compare("memscope read -- then a known flag is a positional",
+            py_memscope("read", "--", pid, addr, "--type", "int8"),
+            c_memscope("read", "--", pid, addr, "--type", "int8"))
+    compare("memscope read a lone --", py_memscope("read", "--"), c_memscope("read", "--"))
+    compare("memscope dump -- then a negative length",
+            py_memscope("dump", "--", pid, addr, "-64"),
+            c_memscope("dump", "--", pid, addr, "-64"))
+    compare("memscope dump positionals then -- then a negative length",
+            py_memscope("dump", pid, addr, "--", "-64"),
+            c_memscope("dump", pid, addr, "--", "-64"))
+    compare("memscope dump two separators: the second is a positional",
+            py_memscope("dump", "--", "--", pid, addr),
+            c_memscope("dump", "--", "--", pid, addr))
+    compare("memscope dump a trailing --",
+            py_memscope("dump", pid, addr, "64", "--"),
+            c_memscope("dump", pid, addr, "64", "--"))
+    compare("memscope dump -- then an unknown flag is a positional",
+            py_memscope("dump", pid, addr, "--", "--bogus"),
+            c_memscope("dump", pid, addr, "--", "--bogus"))
+    compare("memscope ps -- then a name",
+            py_memscope("ps", "--", "no-such-process-xyz"),
+            c_memscope("ps", "--", "no-such-process-xyz"))
+    compare("memscope ps -- then an option-shaped name",
+            py_memscope("ps", "--", "--bogus"), c_memscope("ps", "--", "--bogus"))
+    compare("memscope scan -- then a name",
+            py_memscope("scan", "--", "no-such-process-xyz"),
+            c_memscope("scan", "--", "no-such-process-xyz"))
+    compare("memscope top-level -- before the subcommand",
+            py_memscope("--", "read", pid, addr), c_memscope("--", "read", pid, addr))
+    compare("memscope a lone -- with no subcommand",
+            py_memscope("--"), c_memscope("--"))
+    compare("ptrscan -- then positionals",
+            py_ptrscan("--", pid, addr), c_ptrscan("--", pid, addr))
+    compare("ptrscan positional then -- then positional",
+            py_ptrscan(pid, "--", addr), c_ptrscan(pid, "--", addr))
+    compare("ptrscan -- then --help is not help",
+            py_ptrscan("--", "--help"), c_ptrscan("--", "--help"))
+    compare("ptrscan -- then an unknown flag is a positional",
+            py_ptrscan(pid, addr, "--", "--bogus"), c_ptrscan(pid, addr, "--", "--bogus"))
+    compare("ptrscan a lone --", py_ptrscan("--"), c_ptrscan("--"))
     # A length wide enough to overflow the 32-bit `long` strtol used to parse through --
     # the error must name the digits the user typed, not a saturated LONG_MIN.
     compare("memscope dump length overflows a 32-bit long",

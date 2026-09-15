@@ -7,6 +7,8 @@
  */
 #include "util.h"
 
+#include <string.h>
+
 #include <stdio.h>
 
 static int failures = 0;
@@ -80,11 +82,74 @@ static void test_overflow_rejected(void) {
           ms_parse_hex_u64("FFFFFFFFFFFFFFFF", true, &out) && out == 0xFFFFFFFFFFFFFFFFULL);
 }
 
+
+static void test_double_sign_rejected(void) {
+    printf("\na doubled sign is not a number, the way Python says it is not\n");
+    /* Found by unifying this parser with repl.c's onto one core: the old, separate
+     * implementation here stripped ONE leading '-' itself and handed the rest to strtoull,
+     * which happily accepted a second sign and wrapped -- so "--1" parsed as 1 and "-+1" as
+     * -1, neither of which is a number Python would accept:
+     *
+     *     >>> int("--1", 16)
+     *     ValueError: invalid literal for int() with base 16: '--1'
+     *
+     * The REPL's parser validated every character before converting and always got this
+     * right; sharing one core is what carried that over. Reachable in practice through a
+     * --resolve hop offset, which is the one caller that passes reject_negative=false. */
+    uint64_t out = 0;
+    check("\"--1\" is rejected", !ms_parse_hex_u64("--1", false, &out));
+    check("\"-+1\" is rejected", !ms_parse_hex_u64("-+1", false, &out));
+    check("\"+-1\" is rejected", !ms_parse_hex_u64("+-1", false, &out));
+    check("\"++1\" is rejected", !ms_parse_hex_u64("++1", false, &out));
+    check("a single sign still works", ms_parse_hex_u64("-1", false, &out));
+    check("and so does a bare value", ms_parse_hex_u64("1", true, &out) && out == 1);
+}
+
+static void test_strip_dashdash(void) {
+    printf("\nargparse's end-of-options separator\n");
+
+    char *none[] = {"a", "b"};
+    int n = 2;
+    check("no separator leaves argc alone and returns it",
+          ms_strip_dashdash(&n, none) == 2 && n == 2);
+
+    char *leading[] = {"--", "a", "b"};
+    n = 3;
+    int at = ms_strip_dashdash(&n, leading);
+    check("a leading separator is removed",
+          at == 0 && n == 2 && strcmp(leading[0], "a") == 0 && strcmp(leading[1], "b") == 0);
+
+    char *middle[] = {"a", "--", "b"};
+    n = 3;
+    at = ms_strip_dashdash(&n, middle);
+    check("a separator in the middle is removed and marks the boundary",
+          at == 1 && n == 2 && strcmp(middle[0], "a") == 0 && strcmp(middle[1], "b") == 0);
+
+    /* Only the FIRST is removed -- a second is a literal positional, which is what makes
+     * `dump -- -- 1234 0x400` report an invalid pid of '--' in both implementations. */
+    char *twice[] = {"--", "--", "a"};
+    n = 3;
+    at = ms_strip_dashdash(&n, twice);
+    check("only the first separator is removed",
+          at == 0 && n == 2 && strcmp(twice[0], "--") == 0 && strcmp(twice[1], "a") == 0);
+
+    char *trailing[] = {"a", "--"};
+    n = 2;
+    at = ms_strip_dashdash(&n, trailing);
+    check("a trailing separator is removed and everything after it is nothing",
+          at == 1 && n == 1 && strcmp(trailing[0], "a") == 0);
+
+    n = 0;
+    check("an empty list is handled", ms_strip_dashdash(&n, none) == 0 && n == 0);
+}
+
 int main(void) {
     test_negative_literal_rejected();
     test_negative_literal_encoded_when_allowed();
     test_plus_literal_accepted();
     test_overflow_rejected();
+    test_double_sign_rejected();
+    test_strip_dashdash();
 
     printf("\n");
     if (failures) {

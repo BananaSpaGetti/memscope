@@ -107,6 +107,14 @@ static void print_help(void) {
 }
 
 int main(int argc, char **argv) {
+    /* argparse's `--`: everything after it is a positional, so `ptrscan -- --help` looks
+     * for a process called "--help" rather than printing the help. argv[0] is the program
+     * name, so the scan starts one past it and the boundary is expressed in the same
+     * coordinates as the loop below. */
+    int tail_argc = argc - 1;
+    const int positional_from = ms_strip_dashdash(&tail_argc, argv + 1) + 1;
+    argc = tail_argc + 1;
+
     const char *target_str = NULL;
     const char *address_str = NULL;
     const char *depth_str = NULL;
@@ -118,7 +126,17 @@ int main(int argc, char **argv) {
 
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
-        if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0) {
+        if (i >= positional_from) {
+            /* Past the separator every token is a positional, in the same order the slots
+             * below fill: target, then address. */
+            if (!target_str) {
+                target_str = arg;
+            } else if (!address_str) {
+                address_str = arg;
+            } else {
+                extras[extra_count++] = arg;
+            }
+        } else if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0) {
             /* argparse's help action fires the moment it is parsed, ahead of any
              * required-argument or value check that comes later in argv -- so this has to
              * sit before target/depth/max validation, not after it. */
