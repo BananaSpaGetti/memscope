@@ -107,14 +107,6 @@ static void print_help(void) {
 }
 
 int main(int argc, char **argv) {
-    /* argparse's `--`: everything after it is a positional, so `ptrscan -- --help` looks
-     * for a process called "--help" rather than printing the help. argv[0] is the program
-     * name, so the scan starts one past it and the boundary is expressed in the same
-     * coordinates as the loop below. */
-    int tail_argc = argc - 1;
-    const int positional_from = ms_strip_dashdash(&tail_argc, argv + 1) + 1;
-    argc = tail_argc + 1;
-
     const char *target_str = NULL;
     const char *address_str = NULL;
     const char *depth_str = NULL;
@@ -126,17 +118,7 @@ int main(int argc, char **argv) {
 
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
-        if (i >= positional_from) {
-            /* Past the separator every token is a positional, in the same order the slots
-             * below fill: target, then address. */
-            if (!target_str) {
-                target_str = arg;
-            } else if (!address_str) {
-                address_str = arg;
-            } else {
-                extras[extra_count++] = arg;
-            }
-        } else if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0) {
+        if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0) {
             /* argparse's help action fires the moment it is parsed, ahead of any
              * required-argument or value check that comes later in argv -- so this has to
              * sit before target/depth/max validation, not after it. */
@@ -264,14 +246,20 @@ int main(int argc, char **argv) {
         uint64_t module_offset;
         uint64_t offsets[256];
         int offset_count;
+        bool oversized = false;
         if (!ptrpath_parse(resolve_str, module_name, sizeof(module_name), &module_offset,
-                            offsets, sizeof(offsets) / sizeof(offsets[0]), &offset_count) ||
+                            offsets, sizeof(offsets) / sizeof(offsets[0]), &offset_count,
+                            &oversized) ||
             offset_count > (int)(sizeof(offsets) / sizeof(offsets[0]))) {
             fprintf(stderr, "ptrscan: could not parse path '%s'\n", resolve_str);
             result = 2;
         } else {
             uint64_t address;
-            if (!ptrpath_resolve(&io, module_name, module_offset, offsets, offset_count,
+            /* An offset too wide for uint64_t is a valid literal to ptrscan.py -- it parses
+             * it and only then fails to read the address it lands on. So it is not a parse
+             * error here either: it is a path that cannot resolve. */
+            if (oversized ||
+                !ptrpath_resolve(&io, module_name, module_offset, offsets, offset_count,
                                   modules, module_count, &address)) {
                 printf("could not resolve (module not found or a hop read failed)\n");
                 result = 1;

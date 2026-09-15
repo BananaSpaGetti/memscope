@@ -78,6 +78,13 @@ bool ptrpath_resolve(ProcessIO *process, const char *module_name, uint64_t modul
 int ptrpath_format(const char *module_name, uint64_t module_offset,
                     const uint64_t *offsets, int offset_count, char *buf, size_t buf_size);
 
+/* One divergence from ptrscan.py is deliberate and cannot be closed without arbitrary-
+ * precision addresses: if the LAST hop's offset carries the final address past 2**64, that
+ * address is never read -- resolve() returns it and the caller prints it -- so ptrscan.py
+ * prints a number wider than 64 bits, and this reports the path as unresolvable instead.
+ * Every earlier hop IS exact, because its address is read before the next offset is added,
+ * and a read of an address that wide fails in both implementations. Measured, recorded here
+ * rather than left for the next reader to discover. */
 /* Parses "module+0xOFF -> 0xOFF -> 0xOFF", matching ptrscan.py's parse_path(): split on
  * "->", strip each piece, partition the first piece on "+". Every hex number is parsed
  * base 16 with an optional "0x"/"0X" prefix (matching Python's `int(s, 16)`, which is
@@ -92,9 +99,12 @@ int ptrpath_format(const char *module_name, uint64_t module_offset,
  * exceed `offsets_cap`, mirroring the out-array convention used elsewhere in this
  * codebase). Returns false, leaving every output untouched, if the text cannot be
  * parsed or names more hops than this parser's internal bound allows. */
+/* *oversized_out reports a piece that is a valid hex literal but too wide for uint64_t --
+ * ptrscan.py parses one (a Python int has no width) and then fails to resolve it, so the
+ * caller must treat it as an unresolvable path rather than a malformed one. May be NULL. */
 bool ptrpath_parse(const char *text, char *module_name_out, size_t module_name_cap,
                     uint64_t *module_offset_out, uint64_t *offsets_out, size_t offsets_cap,
-                    int *offset_count_out);
+                    int *offset_count_out, bool *oversized_out);
 
 #define PTRPATH_LIMIT_LINE_MAX 128
 

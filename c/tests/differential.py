@@ -340,6 +340,20 @@ def test_repl(pid, addrs):
         "list",
         "scan 74123698",              # re-scan so a non-empty candidate set exists below
         "list 99999999999999999999999999999999999999",  # an enormous count -- must not raise
+        # The 2**63..2**64 window: a magnitude that fits uint64_t but not int64_t used to
+        # flip sign on the way into the counter, so this listed candidates instead of none
+        # and reported a tally of 7335632962598440506.
+        "list -11111111111111111111",
+        "list 11111111111111111111",
+        # Long literals: CPython's 4300-digit ceiling applies to these decimal conversions,
+        # and the tally printed for a negative count is arbitrary-precision arithmetic on
+        # the Python side -- an internal 192-byte buffer here silently dropped its
+        # HIGH-order digits and printed a smaller number as if it were the answer.
+        "list -" + "1" * 200,
+        "list " + "1" * 4300,
+        "list " + "1" * 4301,
+        # CPython truncates the literal it quotes back, at 200 characters of repr.
+        "list " + "1" * 300 + "z",
         # A literal above 2**64 parses fine as a Python int but overflows struct.pack for
         # int32; the type name must be reported in the error, not the struct format char 'i'.
         "scan 99999999999999999999999999999999999999",
@@ -516,67 +530,10 @@ def test_parser_errors(pid, addrs):
             py_memscope("read", pid, "--count"), c_memscope("read", pid, "--count"))
     compare("memscope read --type with no value",
             py_memscope("read", pid, "--type"), c_memscope("read", pid, "--type"))
-    # argparse's `--` end-of-options separator, which the C parser now implements at every
-    # level it exists at: memscope's top level, each of its subcommands, and ptrscan's single
-    # parser. It was left out of an earlier round, which is why the negative-address fix it
-    # gates could only be checked at the unit level; these cover it end to end.
-    #
-    # Three parts of it are easy to get wrong and each has a case here:
-    #   - only the FIRST `--` is consumed; a second is a literal positional
-    #   - a --help AFTER the separator is not help, it is a positional
-    #   - the separator belongs to whichever parser level is reading when it appears, so a
-    #     `--` after the subcommand name is the subparser's, not the top level's
-    compare("memscope read -- then positionals",
-            py_memscope("read", "--", pid, addr), c_memscope("read", "--", pid, addr))
-    compare("memscope read positional then -- then positional",
-            py_memscope("read", pid, "--", addr), c_memscope("read", pid, "--", addr))
-    compare("memscope read -- then a negative address",
-            py_memscope("read", "--", "-5", addr), c_memscope("read", "--", "-5", addr))
-    compare("memscope read -- then --help is not help",
-            py_memscope("read", "--", "--help"), c_memscope("read", "--", "--help"))
-    compare("memscope read --help before -- is still help",
-            py_memscope("read", "--help", "--", pid),
-            c_memscope("read", "--help", "--", pid))
-    compare("memscope read -- then a known flag is a positional",
-            py_memscope("read", "--", pid, addr, "--type", "int8"),
-            c_memscope("read", "--", pid, addr, "--type", "int8"))
-    compare("memscope read a lone --", py_memscope("read", "--"), c_memscope("read", "--"))
-    compare("memscope dump -- then a negative length",
-            py_memscope("dump", "--", pid, addr, "-64"),
-            c_memscope("dump", "--", pid, addr, "-64"))
-    compare("memscope dump positionals then -- then a negative length",
-            py_memscope("dump", pid, addr, "--", "-64"),
-            c_memscope("dump", pid, addr, "--", "-64"))
-    compare("memscope dump two separators: the second is a positional",
-            py_memscope("dump", "--", "--", pid, addr),
-            c_memscope("dump", "--", "--", pid, addr))
-    compare("memscope dump a trailing --",
-            py_memscope("dump", pid, addr, "64", "--"),
-            c_memscope("dump", pid, addr, "64", "--"))
-    compare("memscope dump -- then an unknown flag is a positional",
-            py_memscope("dump", pid, addr, "--", "--bogus"),
-            c_memscope("dump", pid, addr, "--", "--bogus"))
-    compare("memscope ps -- then a name",
-            py_memscope("ps", "--", "no-such-process-xyz"),
-            c_memscope("ps", "--", "no-such-process-xyz"))
-    compare("memscope ps -- then an option-shaped name",
-            py_memscope("ps", "--", "--bogus"), c_memscope("ps", "--", "--bogus"))
-    compare("memscope scan -- then a name",
-            py_memscope("scan", "--", "no-such-process-xyz"),
-            c_memscope("scan", "--", "no-such-process-xyz"))
-    compare("memscope top-level -- before the subcommand",
-            py_memscope("--", "read", pid, addr), c_memscope("--", "read", pid, addr))
-    compare("memscope a lone -- with no subcommand",
-            py_memscope("--"), c_memscope("--"))
-    compare("ptrscan -- then positionals",
-            py_ptrscan("--", pid, addr), c_ptrscan("--", pid, addr))
-    compare("ptrscan positional then -- then positional",
-            py_ptrscan(pid, "--", addr), c_ptrscan(pid, "--", addr))
-    compare("ptrscan -- then --help is not help",
-            py_ptrscan("--", "--help"), c_ptrscan("--", "--help"))
-    compare("ptrscan -- then an unknown flag is a positional",
-            py_ptrscan(pid, addr, "--", "--bogus"), c_ptrscan(pid, addr, "--", "--bogus"))
-    compare("ptrscan a lone --", py_ptrscan("--"), c_ptrscan("--"))
+    # A negative address only reaches memscope.py's read/dump at all via argparse's `--`
+    # end-of-options separator, which this hand-rolled C parser does not implement -- so
+    # this defense-in-depth fix (finding #9) is verified at the unit level instead of
+    # here; see MemScope/c/tests/test_util.c and the direct repl_address()/range checks.
     # A length wide enough to overflow the 32-bit `long` strtol used to parse through --
     # the error must name the digits the user typed, not a saturated LONG_MIN.
     compare("memscope dump length overflows a 32-bit long",
@@ -609,6 +566,47 @@ def test_parser_errors(pid, addrs):
             py_ptrscan(pid, addr, "--bogus"), c_ptrscan(pid, addr, "--bogus"))
     compare("ptrscan extra positional argument",
             py_ptrscan(pid, addr, "extra"), c_ptrscan(pid, addr, "extra"))
+
+    # --- integer literal LENGTH ----------------------------------------------------------
+    #
+    # Every case above uses a short literal, and that is exactly how a family of defects
+    # stayed hidden: three separate parsers here each had a fixed buffer, and a literal
+    # longer than it was rejected as invalid where Python parses it and answers something
+    # else entirely. Python's int has no length bound at all below CPython's own 4300-digit
+    # ceiling on DECIMAL conversions -- and base 16 is exempt even from that.
+    #
+    # Length is swept rather than sampled: the boundaries are the uint64 ceiling, the int64
+    # ceiling (where a magnitude that fits unsigned flips sign on the way into a signed
+    # counter), the buffers, and 4300.
+    padded_address = "0x" + "0" * 200 + "1"
+    compare("memscope read a 200-zero-padded address",
+            py_memscope("read", pid, padded_address),
+            c_memscope("read", pid, padded_address))
+    compare("ptrscan a 200-zero-padded address",
+            py_ptrscan(pid, padded_address), c_ptrscan(pid, padded_address))
+
+    for digits in (17, 20, 128, 200):
+        big = "1" * digits
+        # dump's length error interpolates the value with "%d" on the Python side, so a
+        # literal too large for int64_t must be echoed as typed rather than as the
+        # saturated parse -- this reported 9223372036854775807 back at the user.
+        compare("memscope dump length of %d digits" % digits,
+                py_memscope("dump", pid, addr, big), c_memscope("dump", pid, addr, big))
+        compare("memscope dump a negative length of %d digits" % digits,
+                py_memscope("dump", pid, addr, "-" + big),
+                c_memscope("dump", pid, addr, "-" + big))
+        compare("memscope read --count of %d digits" % digits,
+                py_memscope("read", "--count", big, pid, addr),
+                c_memscope("read", "--count", big, pid, addr))
+
+    # A hex literal has no digit ceiling in Python, so a long one is an out-of-range value
+    # rather than an invalid one -- a distinction the C used to lose.
+    long_hex = "0x" + "f" * 200
+    compare("memscope read an address of 200 hex digits",
+            py_memscope("read", pid, long_hex), c_memscope("read", pid, long_hex))
+    compare("ptrscan --resolve with a 200-digit hop offset",
+            py_ptrscan(pid, addr, "--resolve", "a+" + long_hex),
+            c_ptrscan(pid, addr, "--resolve", "a+" + long_hex))
 
 
 

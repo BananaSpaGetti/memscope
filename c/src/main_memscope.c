@@ -35,13 +35,7 @@
 
 /* True if any element of argv is exactly "-h" or "--help" -- the way argparse recognises the
  * help flag anywhere among a subcommand's arguments, taking priority over every other error. */
-static bool has_help_flag_before(int argc, char **argv, int limit) {
-    /* `limit` is ms_strip_dashdash's boundary: a -h or --help AFTER argparse's `--` is not
-     * help at all, it is a positional. Measured: `read -- --help` reports an error about a
-     * positional, not the read help. */
-    if (limit < argc) {
-        argc = limit;
-    }
+static bool has_help_flag(int argc, char **argv) {
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             return true;
@@ -207,14 +201,11 @@ static int ps_compare(const void *a, const void *b) {
 }
 
 static int cmd_ps(int argc, char **argv) {
-    const int positional_from = ms_strip_dashdash(&argc, argv);
-    if (has_help_flag_before(argc, argv, positional_from)) {
+    if (has_help_flag(argc, argv)) {
         print_ps_help();
         return 0;
     }
 
-    /* After a `--` the next token is the name even when it looks like an option, which is
-     * what makes `ps -- --bogus` a search for a process called "--bogus". */
     const char *name = argc > 0 ? argv[0] : "";
 
     int count = process_list(name, NULL, 0);
@@ -260,8 +251,7 @@ static int cmd_ps(int argc, char **argv) {
 /* --- read ---------------------------------------------------------------------------------- */
 
 static int cmd_read(int argc, char **argv) {
-    const int positional_from = ms_strip_dashdash(&argc, argv);
-    if (has_help_flag_before(argc, argv, positional_from)) {
+    if (has_help_flag(argc, argv)) {
         print_read_help();
         return 0;
     }
@@ -270,31 +260,15 @@ static int cmd_read(int argc, char **argv) {
     const char *address_str = NULL;
     const char *type_str = "int32";
     int64_t count = 1;
+    /* Kept so an out-of-range count can be reported as the user typed it; strtoll
+     * saturates and the Python side's int does not. */
+    const char *count_str = "1";
     const char *extras[argc > 0 ? argc : 1];
     int extra_count = 0;
 
     for (int i = 0; i < argc; i++) {
         const char *arg = argv[i];
-        if (i >= positional_from) {
-            /* Past argparse's `--` even a KNOWN flag is a positional: `read -- 1234 0x400
-             * --type int8` fills pid and address, then reports --type and int8 as
-             * unrecognized, because read declares only two positionals. Guarding just the
-             * unrecognized branch below was not enough -- these flag branches run first. */
-            if (!pid_str) {
-                pid_str = arg;
-                if (!ms_looks_like_int(pid_str)) {
-                    char message[32832]; /* see the identical comment below. */
-                    snprintf(message, sizeof(message),
-                             "argument pid: invalid int value: '%s'", pid_str);
-                    print_parse_error(USAGE_READ, "read", message);
-                    return 2;
-                }
-            } else if (!address_str) {
-                address_str = arg;
-            } else {
-                extras[extra_count++] = arg;
-            }
-        } else if (strncmp(arg, "--type", 6) == 0 && (arg[6] == '\0' || arg[6] == '=')) {
+        if (strncmp(arg, "--type", 6) == 0 && (arg[6] == '\0' || arg[6] == '=')) {
             if (arg[6] == '=') {
                 type_str = arg + 7;
             } else if (i + 1 < argc) {
@@ -324,15 +298,13 @@ static int cmd_read(int argc, char **argv) {
                 return 2;
             }
             count = strtoll(value, NULL, 10);
-        } else if (i < positional_from && arg[0] == '-' && arg[1] != '\0'
-                   && !ms_looks_like_negative_number(arg)) {
+            count_str = value;
+        } else if (arg[0] == '-' && arg[1] != '\0' && !ms_looks_like_negative_number(arg)) {
             /* A token that starts with '-', is not one of this subcommand's known flags,
              * and does not look like a negative number is what argparse itself calls
              * "unrecognized" -- collected for the top-level error below rather than ever
              * being tried against a positional slot. `-5` still reaches pid/address here;
-             * `-0x10` and `--bogus` do not, matching Python exactly. Past `--` none of that
-             * applies: everything left is a positional, so `read -- --help` lands in the
-             * pid slot and is reported as an invalid int, which is what Python does. */
+             * `-0x10` and `--bogus` do not, matching Python exactly. */
             extras[extra_count++] = arg;
         } else if (!pid_str) {
             /* argparse converts a positional the moment it is matched, not once the whole
@@ -386,8 +358,12 @@ static int cmd_read(int argc, char **argv) {
      * intended. Matches memscope.py's own bound, added the same review round for the same
      * reason. */
     if (count > MS_READ_MAX_COUNT) {
-        fprintf(stderr, "read: count must not exceed %lld: '%" PRId64 "'\n",
-                MS_READ_MAX_COUNT, count);
+        /* The literal, not `count`: strtoll saturates and memscope.py's int does not,
+         * so a count of twenty 1s was quoted back as 9223372036854775807. */
+        bool count_negative = false;
+        const char *count_shown = ms_canonical_decimal(count_str, &count_negative);
+        fprintf(stderr, "read: count must not exceed %lld: '%s%s'\n",
+                MS_READ_MAX_COUNT, count_negative ? "-" : "", count_shown);
         return 2;
     }
 
@@ -424,8 +400,7 @@ static int cmd_read(int argc, char **argv) {
 /* --- dump ---------------------------------------------------------------------------------- */
 
 static int cmd_dump(int argc, char **argv) {
-    const int positional_from = ms_strip_dashdash(&argc, argv);
-    if (has_help_flag_before(argc, argv, positional_from)) {
+    if (has_help_flag(argc, argv)) {
         print_dump_help();
         return 0;
     }
@@ -433,18 +408,18 @@ static int cmd_dump(int argc, char **argv) {
     const char *pid_str = NULL;
     const char *address_str = NULL;
     int64_t length = 64;
+    const char *length_str = "64";   /* see count_str in cmd_read */
     bool have_length = false;
     const char *extras[argc > 0 ? argc : 1];
     int extra_count = 0;
 
     for (int i = 0; i < argc; i++) {
         const char *arg = argv[i];
-        if (i < positional_from && arg[0] == '-' && arg[1] != '\0'
-            && !ms_looks_like_negative_number(arg)) {
+        if (arg[0] == '-' && arg[1] != '\0' && !ms_looks_like_negative_number(arg)) {
             /* See cmd_read's identical check: an unrecognized option-like token is collected
              * here rather than tried against pid/address/length, matching argparse. `-5` (a
              * valid negative dump length) still reaches the length slot below; `--bogus`
-             * and `-0x10` do not. Past `--` every token is a positional instead. */
+             * and `-0x10` do not. */
             extras[extra_count++] = arg;
         } else if (!pid_str) {
             /* argparse converts a positional the moment it is matched, not once the whole
@@ -475,6 +450,7 @@ static int cmd_dump(int argc, char **argv) {
                 return 2;
             }
             length = strtoll(argv[i], NULL, 10);
+            length_str = argv[i];
             have_length = true;
         } else {
             extras[extra_count++] = argv[i];
@@ -502,7 +478,10 @@ static int cmd_dump(int argc, char **argv) {
      * fall through to the `if (length > 0)` below, printing nothing and exiting 0, while
      * memscope.py rejected it; reject it here the same way, and before attaching. */
     if (length < 0) {
-        fprintf(stderr, "dump: length must not be negative: '%" PRId64 "'\n", length);
+        bool shown_negative = false;
+        const char *shown = ms_canonical_decimal(length_str, &shown_negative);
+        fprintf(stderr, "dump: length must not be negative: '%s%s'\n",
+                shown_negative ? "-" : "", shown);
         return 2;
     }
     /* A length this large reaches malloc((size_t)length) with a request nothing here can
@@ -512,8 +491,10 @@ static int cmd_dump(int argc, char **argv) {
      * traceback. Matches memscope.py's own bound, added the same review round for the same
      * reason. */
     if (length > MS_DUMP_MAX_LENGTH) {
-        fprintf(stderr, "dump: length must not exceed %lld bytes: '%" PRId64 "'\n",
-                MS_DUMP_MAX_LENGTH, length);
+        bool length_negative = false;
+        const char *length_shown = ms_canonical_decimal(length_str, &length_negative);
+        fprintf(stderr, "dump: length must not exceed %lld bytes: '%s%s'\n",
+                MS_DUMP_MAX_LENGTH, length_negative ? "-" : "", length_shown);
         return 2;
     }
 
@@ -559,24 +540,6 @@ static int cmd_dump(int argc, char **argv) {
 /* --- entry point ----------------------------------------------------------------------------- */
 
 int main(int argc, char **argv) {
-    /* The top-level parser has its own `--`, but it only ever owns one that comes BEFORE
-     * the subcommand name: once argparse has matched the subcommand, every remaining token
-     * goes to the subparser untouched, separator included. So `memscope -- read 1234 0x400`
-     * runs read, while in `dump -- -- 1234 0x400` both separators belong to dump -- which
-     * strips the first and reports the second as an invalid pid, exactly as Python does.
-     * Stripping greedily here ate the subparser's separator and got both of those wrong.
-     *
-     * The `argc > 2` is the other half of it: argparse only consumes the separator when a
-     * positional follows it for the parser to match. A lone `memscope --` has nothing to
-     * match, so the token survives and is reported as an unrecognized argument rather than
-     * printing the help. Measured, not reasoned about. */
-    if (argc > 2 && strcmp(argv[1], "--") == 0) {
-        for (int i = 1; i + 1 < argc; i++) {
-            argv[i] = argv[i + 1];
-        }
-        argc--;
-    }
-
     if (argc < 2) {
         /* No subcommand: argparse's parse_args() succeeds with args.command == None, and main()
          * falls through to parser.print_help() (to stdout) followed by `return 2`. */
@@ -585,14 +548,6 @@ int main(int argc, char **argv) {
     }
 
     const char *command = argv[1];
-    if (strcmp(command, "--") == 0) {
-        /* A separator with nothing after it to match is not a subcommand and not an invalid
-         * choice either: argparse consumes it, finds no command, and then reports the token
-         * it could not place. Measured -- `memscope --` says "unrecognized arguments: --". */
-        const char *leftover[1] = {command};
-        print_unrecognized(1, leftover);
-        return 2;
-    }
     if (strcmp(command, "-h") == 0 || strcmp(command, "--help") == 0) {
         print_full_help();
         return 0;
@@ -611,8 +566,7 @@ int main(int argc, char **argv) {
         return cmd_dump(sub_argc, sub_argv);
     }
     if (strcmp(command, "scan") == 0) {
-        const int scan_positional_from = ms_strip_dashdash(&sub_argc, sub_argv);
-        if (has_help_flag_before(sub_argc, sub_argv, scan_positional_from)) {
+        if (has_help_flag(sub_argc, sub_argv)) {
             print_scan_help();
             return 0;
         }

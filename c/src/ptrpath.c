@@ -281,6 +281,10 @@ bool ptrpath_resolve(ProcessIO *process, const char *module_name, uint64_t modul
         return false;
     }
 
+    /* Wrapping is deliberate: a negative hop offset arrives as its two's-complement
+     * pattern, so an addition that overflows is exactly how `value - 16` is computed. An
+     * offset genuinely too wide for uint64_t is caught at parse time instead, where the
+     * two cases can still be told apart. */
     uint64_t address = base + module_offset;
     for (int i = 0; i < offset_count; i++) {
         uint8_t buf[8] = {0};
@@ -342,9 +346,30 @@ static void trim(char *s) {
     }
 }
 
+/* ptrscan.py's parse_path runs int(piece, 16), and a Python int has no width -- so a piece
+ * far too large for uint64_t parses there and only fails later, when the resolve tries to
+ * read the address it produces. Rejecting it here made a failed resolve (exit 1) into a
+ * parse error (exit 2) with a different message.
+ *
+ * Out-of-range is therefore not a failure here; it is reported through *oversized, and the
+ * caller treats such a path as one that cannot resolve -- which is what ptrscan.py does with
+ * it, since an address that wide satisfies no read. Only a malformed literal fails. */
+static bool parse_path_offset(const char *text, uint64_t *out, bool *oversized) {
+    MsIntOverflow overflow;
+    if (ms_parse_py_int(text, 16, false, out, &overflow, NULL, 0)) {
+        return true;
+    }
+    if (overflow.triggered) {
+        *oversized = true;
+        *out = 0;
+        return true;
+    }
+    return false;
+}
+
 bool ptrpath_parse(const char *text, char *module_name_out, size_t module_name_cap,
                     uint64_t *module_offset_out, uint64_t *offsets_out, size_t offsets_cap,
-                    int *offset_count_out) {
+                    int *offset_count_out, bool *oversized_out) {
     char buf[2048];
     size_t len = strlen(text);
     if (len >= sizeof(buf)) {
@@ -383,15 +408,16 @@ bool ptrpath_parse(const char *text, char *module_name_out, size_t module_name_c
     trim(module_name);
     trim(offset_hex);
 
+    bool oversized = false;
     uint64_t module_offset;
-    if (!ms_parse_hex_u64(offset_hex, false, &module_offset)) {
+    if (!parse_path_offset(offset_hex, &module_offset, &oversized)) {
         return false;
     }
 
     int offset_count = piece_count - 1;
     uint64_t parsed_offsets[PTRPATH_PARSE_MAX_PIECES];
     for (int i = 0; i < offset_count; i++) {
-        if (!ms_parse_hex_u64(pieces[1 + i], false, &parsed_offsets[i])) {
+        if (!parse_path_offset(pieces[1 + i], &parsed_offsets[i], &oversized)) {
             return false;
         }
     }
@@ -406,6 +432,9 @@ bool ptrpath_parse(const char *text, char *module_name_out, size_t module_name_c
     size_t n = (size_t)offset_count < offsets_cap ? (size_t)offset_count : offsets_cap;
     for (size_t i = 0; i < n; i++) {
         offsets_out[i] = parsed_offsets[i];
+    }
+    if (oversized_out) {
+        *oversized_out = oversized;
     }
     if (offset_count_out) {
         *offset_count_out = offset_count;

@@ -2,6 +2,7 @@
  * values -- see include/values.h.
  */
 #include "values.h"
+#include "util.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -41,6 +42,11 @@ static const Alias ALIASES[] = {
 };
 
 #define LIT_BUF_SIZE 128
+
+/* CPython's default sys.get_int_max_str_digits(). It bounds decimal conversions only; the
+ * power-of-two bases have no such limit, which is why the check that uses this sits inside
+ * the base-10 branch. */
+#define PY_INT_MAX_STR_DIGITS 4300
 
 static bool type_ok(MsType kind) {
     return kind >= 0 && kind < MS_TYPE_COUNT;
@@ -122,73 +128,121 @@ static void write_le(uint8_t *out, uint64_t value, size_t size) {
  * where they may appear). That is not implemented here -- it would add a second parsing
  * pass for comparatively little real-world benefit next to the leading-zero fix above -- so
  * a literal containing '_' is rejected the same way plain garbage is. */
+/* CPython truncates the literal it quotes back; see ms_py_literal_repr. */
+static void invalid_literal(char *err, size_t err_cap, const char *literal) {
+    char shown[208];
+    ms_py_literal_repr(literal, shown, sizeof(shown));
+    set_err(err, err_cap, "invalid literal for int() with base 0: %s", shown);
+}
+
 static bool parse_number_literal(const char *literal, bool *negative, uint64_t *magnitude,
                                   bool *overflowed, char *err, size_t err_cap) {
     const char *start, *end;
     if (!trim(literal, &start, &end)) {
-        set_err(err, err_cap, "invalid literal for int() with base 0: '%s'", literal);
+        invalid_literal(err, err_cap, literal);
         return false;
     }
-    size_t len = (size_t)(end - start);
-    if (len >= LIT_BUF_SIZE) {
-        set_err(err, err_cap, "invalid literal for int() with base 0: '%s'", literal);
-        return false;
-    }
-    char buf[LIT_BUF_SIZE];
-    memcpy(buf, start, len);
-    buf[len] = '\0';
-
-    const char *p = buf;
+    /* Nothing is copied into a fixed buffer until the digits have been counted down to a
+     * length that certainly fits one. The previous version copied first and rejected any
+     * literal of LIT_BUF_SIZE characters or more as invalid -- but Python has no such
+     * bound, so `scan` on a 200-digit value answered "invalid literal" where memscope.py
+     * answered that the value is out of range for the scan type. Found by sweeping literal
+     * length; the hand-picked cases this parser was checked against were all short. */
+    const char *p = start;
     bool neg = false;
-    if (*p == '+' || *p == '-') {
+    if (p < end && (*p == '+' || *p == '-')) {
         neg = (*p == '-');
         p++;
     }
-    if (*p == '\0') {
-        set_err(err, err_cap, "invalid literal for int() with base 0: '%s'", literal);
+    if (p >= end) {
+        invalid_literal(err, err_cap, literal);
         return false;
     }
 
-    char *endp;
-    unsigned long long mag;
-    errno = 0;
-    if (p[0] == '0' && (p[1] == 'b' || p[1] == 'B')) {
-        if (p[2] == '\0') {
-            set_err(err, err_cap, "invalid literal for int() with base 0: '%s'", literal);
+    int base = 10;
+    if (end - p >= 2 && p[0] == '0' && (p[1] == 'b' || p[1] == 'B')) {
+        base = 2;
+        p += 2;
+    } else if (end - p >= 2 && p[0] == '0' && (p[1] == 'o' || p[1] == 'O')) {
+        base = 8;
+        p += 2;
+    } else if (end - p >= 2 && p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
+        base = 16;
+        p += 2;
+    }
+    if (p >= end) {
+        invalid_literal(err, err_cap, literal);
+        return false;
+    }
+
+    /* Every character must be a digit of the chosen base. This replaces the old strtoull
+     * end-pointer check, which could not run until after the copy above. */
+    for (const char *q = p; q < end; q++) {
+        int ok;
+        switch (base) {
+            case 2:  ok = (*q == '0' || *q == '1'); break;
+            case 8:  ok = (*q >= '0' && *q <= '7'); break;
+            case 16: ok = isxdigit((unsigned char)*q); break;
+            default: ok = isdigit((unsigned char)*q); break;
+        }
+        if (!ok) {
+            invalid_literal(err, err_cap, literal);
             return false;
         }
-        mag = strtoull(p + 2, &endp, 2);
-    } else if (p[0] == '0' && (p[1] == 'o' || p[1] == 'O')) {
-        if (p[2] == '\0') {
-            set_err(err, err_cap, "invalid literal for int() with base 0: '%s'", literal);
-            return false;
-        }
-        mag = strtoull(p + 2, &endp, 8);
-    } else if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
-        if (p[2] == '\0') {
-            set_err(err, err_cap, "invalid literal for int() with base 0: '%s'", literal);
-            return false;
-        }
-        mag = strtoull(p + 2, &endp, 16);
-    } else {
+    }
+
+    if (base == 10) {
         /* Plain decimal: a leading zero is only legal when the whole literal is zero. */
-        if (p[0] == '0') {
-            bool all_zero = true;
-            for (const char *q = p; *q; q++) {
+        if (*p == '0') {
+            for (const char *q = p; q < end; q++) {
                 if (*q != '0') {
-                    all_zero = false;
-                    break;
+                    set_err(err, err_cap,
+                            "invalid literal for int() with base 0: '%s'", literal);
+                    return false;
                 }
             }
-            if (!all_zero) {
-                set_err(err, err_cap, "invalid literal for int() with base 0: '%s'", literal);
-                return false;
-            }
         }
-        mag = strtoull(p, &endp, 10);
+        /* CPython's own ceiling on a decimal conversion, and only on a decimal one: the
+         * power-of-two bases are exempt from it. Measured -- the count is every digit
+         * after the sign, leading zeros included, and an invalid character is reported
+         * before this rather than after it. */
+        size_t digit_count = (size_t)(end - p);
+        if (digit_count > PY_INT_MAX_STR_DIGITS) {
+            set_err(err, err_cap,
+                    "Exceeds the limit (%d digits) for integer string conversion: value has "
+                    "%zu digits; use sys.set_int_max_str_digits() to increase the limit",
+                    PY_INT_MAX_STR_DIGITS, digit_count);
+            return false;
+        }
     }
-    if (endp == p || *endp != '\0') {
-        set_err(err, err_cap, "invalid literal for int() with base 0: '%s'", literal);
+
+    while (p + 1 < end && *p == '0') {
+        p++;
+    }
+
+    /* Past this many significant digits the value cannot fit in uint64_t whatever they are,
+     * so the answer is the same one strtoull would reach through ERANGE -- without needing
+     * a buffer big enough to hold the literal. */
+    static const size_t max_digits[17] = {
+        [2] = 64, [8] = 22, [10] = 20, [16] = 16,
+    };
+    size_t significant = (size_t)(end - p);
+    if (significant > max_digits[base]) {
+        *negative = neg;
+        *magnitude = UINT64_MAX;
+        *overflowed = true;
+        return true;
+    }
+
+    char buf[LIT_BUF_SIZE];
+    memcpy(buf, p, significant);
+    buf[significant] = '\0';
+
+    char *endp;
+    errno = 0;
+    unsigned long long mag = strtoull(buf, &endp, base);
+    if (endp == buf || *endp != '\0') {
+        invalid_literal(err, err_cap, literal);
         return false;
     }
 

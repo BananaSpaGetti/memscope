@@ -237,7 +237,7 @@ static void test_round_trip(void) {
         uint64_t offsets[8];
         int offset_count = 0;
         bool ok = ptrpath_parse(canonical[i], module_name, sizeof(module_name),
-                                 &module_offset, offsets, 8, &offset_count);
+                                 &module_offset, offsets, 8, &offset_count, NULL);
         char detail[160];
         snprintf(detail, sizeof(detail), "'%s'", canonical[i]);
         check("parses", ok, detail);
@@ -256,7 +256,7 @@ static void test_round_trip(void) {
     uint64_t offsets[8];
     int offset_count = 0;
     bool ok = ptrpath_parse("game.exe+10->0x18", module_name, sizeof(module_name),
-                             &module_offset, offsets, 8, &offset_count);
+                             &module_offset, offsets, 8, &offset_count, NULL);
     check("non-canonical input parses", ok, NULL);
     check("module name matches", ok && strcmp(module_name, "game.exe") == 0, NULL);
     check("offset without a 0x prefix is still base 16", ok && module_offset == 0x10, NULL);
@@ -265,7 +265,7 @@ static void test_round_trip(void) {
     /* A head with no '+' is what raises ValueError in the Python; this parser reports
      * failure instead of crashing. */
     ok = ptrpath_parse("game.exe", module_name, sizeof(module_name), &module_offset, offsets,
-                        8, &offset_count);
+                        8, &offset_count, NULL);
     check("a path with no '+' is rejected, not crashed on", !ok, NULL);
 }
 

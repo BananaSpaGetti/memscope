@@ -94,7 +94,11 @@ static void add_decimal(const char *magnitude, uint64_t add, char *out, size_t o
     size_t alen = strlen(add_digits);
     size_t rlen = (mlen > alen ? mlen : alen) + 1;
 
-    char reversed[192];
+    /* Wide enough for any magnitude the parser accepts. At 192 this clamp did not truncate
+     * the printed tally, it silently dropped the HIGH-order digits of the sum and printed a
+     * smaller number as if it were the answer -- `list` on a 200-digit negative count
+     * reported 205 digits of a 221-digit total. */
+    char reversed[MS_PY_INT_MAX_STR_DIGITS + 64];
     if (rlen > sizeof(reversed)) {
         rlen = sizeof(reversed);
     }
@@ -397,8 +401,13 @@ static void cmd_list(Scanner *scanner, ReplTokens *tokens) {
     char overflow_magnitude[sizeof(((PyIntOverflow *)0)->magnitude)] = "";
     if (tokens->rest_count >= 1) {
         uint64_t parsed;
+        const char *list_token = tokens->rest[0];
+        while (isspace((unsigned char)*list_token)) {
+            list_token++;
+        }
+        bool list_token_negative = (*list_token == '-');
         PyIntOverflow overflow;
-        char err[128];
+        char err[256];   /* the digit-limit message is ~139 characters */
         if (!parse_py_int(tokens->rest[0], 10, false, &parsed, &overflow, err, sizeof(err))) {
             if (!overflow.triggered) {
                 printf("  error: %s\n", err);
@@ -408,6 +417,19 @@ static void cmd_list(Scanner *scanner, ReplTokens *tokens) {
                 overflow_none = true;
                 snprintf(overflow_magnitude, sizeof(overflow_magnitude), "%s",
                          overflow.magnitude);
+            } else {
+                overflow_all = true;
+            }
+        } else if ((int64_t)parsed < 0 || (list_token_negative && parsed != 0)) {
+            /* Fits uint64_t but not int64_t, so narrowing it here would flip its sign --
+             * the same window cmd_pscan's depth has. Python's int has no such boundary, so
+             * take the decisions the overflow branch above takes: a magnitude that large is
+             * every candidate when positive and none when negative. */
+            bool list_banner_negative = false;
+            const char *list_digits = ms_canonical_decimal(list_token, &list_banner_negative);
+            if (list_banner_negative) {
+                overflow_none = true;
+                snprintf(overflow_magnitude, sizeof(overflow_magnitude), "%s", list_digits);
             } else {
                 overflow_all = true;
             }
@@ -451,7 +473,7 @@ static void cmd_list(Scanner *scanner, ReplTokens *tokens) {
         /* total - limit, computed exactly: limit's magnitude does not fit in 64 bits, so the
          * true difference (total + |limit|) may not either -- add_decimal never overflows
          * because it works in decimal digits, not machine words. */
-        char more[192];
+        char more[MS_PY_INT_MAX_STR_DIGITS + 64];  /* holds total + any magnitude the parser accepts */
         add_decimal(overflow_magnitude, (uint64_t)total, more, sizeof(more));
         printf("  ... %s more\n", more);
     } else if (!overflow_all && total > limit) {
@@ -466,7 +488,7 @@ static void cmd_write(Scanner *scanner, ReplTokens *tokens) {
         return;
     }
     uint64_t address;
-    char err[128];
+    char err[256];   /* the digit-limit message is ~139 characters */
     if (!parse_py_int(tokens->rest[0], 16, true, &address, NULL, err, sizeof(err))) {
         printf("  error: %s\n", err);
         return;
@@ -517,7 +539,7 @@ static void cmd_freeze(Scanner *scanner, ReplTokens *tokens, FrozenSet *frozen) 
         return;
     }
     uint64_t address;
-    char err[128];
+    char err[256];   /* the digit-limit message is ~139 characters */
     if (!parse_py_int(tokens->rest[0], 16, true, &address, NULL, err, sizeof(err))) {
         printf("  error: %s\n", err);
         return;
@@ -551,7 +573,7 @@ static void cmd_pscan(Scanner *scanner, unsigned long pid, ReplTokens *tokens) {
         return;
     }
     uint64_t target;
-    char err[128];
+    char err[256];   /* the digit-limit message is ~139 characters */
     if (!parse_py_int(tokens->rest[0], 16, true, &target, NULL, err, sizeof(err))) {
         printf("  error: %s\n", err);
         return;
@@ -564,9 +586,14 @@ static void cmd_pscan(Scanner *scanner, unsigned long pid, ReplTokens *tokens) {
      * search this shallow always terminates on its own long before either value could
      * matter, so there is nothing here worth refusing outright. */
     int64_t depth = 3;
-    char depth_banner[192] = "3";
+    char depth_banner[MS_PY_INT_MAX_STR_DIGITS + 64] = "3";      /* holds any magnitude the parser accepts */
     if (tokens->rest_count > 1) {
         uint64_t depth_parsed;
+        const char *depth_token = tokens->rest[1];
+        while (isspace((unsigned char)*depth_token)) {
+            depth_token++;
+        }
+        bool depth_token_negative = (*depth_token == '-');
         PyIntOverflow overflow;
         if (!parse_py_int(tokens->rest[1], 10, false, &depth_parsed, &overflow, err, sizeof(err))) {
             if (!overflow.triggered) {
@@ -584,6 +611,22 @@ static void cmd_pscan(Scanner *scanner, unsigned long pid, ReplTokens *tokens) {
                 depth = INT64_MAX;
                 snprintf(depth_banner, sizeof(depth_banner), "%s", overflow.magnitude);
             }
+        } else if ((int64_t)depth_parsed < 0 || (depth_token_negative && depth_parsed != 0)) {
+            /* The magnitude fits uint64_t but not int64_t, so narrowing it here would flip
+             * its sign: `pscan <addr> -11111111111111111111` reported a depth of
+             * 7335632962598440505 and then searched to it. Python has no such boundary, so
+             * take the same two decisions the overflow branch above takes, for the same
+             * reasons -- an empty range when negative, a clamped search when positive -- and
+             * report the number the user actually typed. */
+            bool banner_negative = false;
+            const char *banner_digits = ms_canonical_decimal(depth_token, &banner_negative);
+            if (banner_negative) {
+                depth = 0;
+                snprintf(depth_banner, sizeof(depth_banner), "-%s", banner_digits);
+            } else {
+                depth = INT64_MAX;
+                snprintf(depth_banner, sizeof(depth_banner), "%s", banner_digits);
+            }
         } else {
             depth = (int64_t)depth_parsed;
             snprintf(depth_banner, sizeof(depth_banner), "%" PRId64, depth);
@@ -591,7 +634,7 @@ static void cmd_pscan(Scanner *scanner, unsigned long pid, ReplTokens *tokens) {
     }
     uint64_t max_offset = 0x400;
     bool max_offset_negative = false;
-    char max_offset_banner[192] = "400";
+    char max_offset_banner[MS_PY_INT_MAX_STR_DIGITS + 64] = "400";  /* same */
     if (tokens->rest_count > 2) {
         const char *p = tokens->rest[2];
         while (isspace((unsigned char)*p)) p++;

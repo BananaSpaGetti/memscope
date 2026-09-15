@@ -7,9 +7,9 @@
  */
 #include "util.h"
 
-#include <string.h>
 
 #include <stdio.h>
+#include <string.h>
 
 static int failures = 0;
 
@@ -105,42 +105,128 @@ static void test_double_sign_rejected(void) {
     check("and so does a bare value", ms_parse_hex_u64("1", true, &out) && out == 1);
 }
 
-static void test_strip_dashdash(void) {
-    printf("\nargparse's end-of-options separator\n");
 
-    char *none[] = {"a", "b"};
-    int n = 2;
-    check("no separator leaves argc alone and returns it",
-          ms_strip_dashdash(&n, none) == 2 && n == 2);
+/* --- literal length, the variable the first corpus for this parser never varied ---------- */
 
-    char *leading[] = {"--", "a", "b"};
-    n = 3;
-    int at = ms_strip_dashdash(&n, leading);
-    check("a leading separator is removed",
-          at == 0 && n == 2 && strcmp(leading[0], "a") == 0 && strcmp(leading[1], "b") == 0);
+static void fill(char *buf, char c, size_t n) {
+    memset(buf, c, n);
+    buf[n] = '\0';
+}
 
-    char *middle[] = {"a", "--", "b"};
-    n = 3;
-    at = ms_strip_dashdash(&n, middle);
-    check("a separator in the middle is removed and marks the boundary",
-          at == 1 && n == 2 && strcmp(middle[0], "a") == 0 && strcmp(middle[1], "b") == 0);
+static void test_leading_zeros_are_not_digits(void) {
+    printf("\nleading zeros do not count against the digit buffer\n");
+    /* Python: int("0x" + "0" * 200 + "1", 16) == 1. The parser used to measure the literal
+     * before stripping them, so a padded address was rejected as invalid while memscope.py
+     * read address 1. */
+    char literal[512];
+    literal[0] = '0';
+    literal[1] = 'x';
+    fill(literal + 2, '0', 200);
+    literal[202] = '1';
+    literal[203] = '\0';
 
-    /* Only the FIRST is removed -- a second is a literal positional, which is what makes
-     * `dump -- -- 1234 0x400` report an invalid pid of '--' in both implementations. */
-    char *twice[] = {"--", "--", "a"};
-    n = 3;
-    at = ms_strip_dashdash(&n, twice);
-    check("only the first separator is removed",
-          at == 0 && n == 2 && strcmp(twice[0], "--") == 0 && strcmp(twice[1], "a") == 0);
+    uint64_t out = 0;
+    check("a 200-zero-padded hex literal parses", ms_parse_hex_u64(literal, true, &out));
+    check("and its value is 1", out == 1);
 
-    char *trailing[] = {"a", "--"};
-    n = 2;
-    at = ms_strip_dashdash(&n, trailing);
-    check("a trailing separator is removed and everything after it is nothing",
-          at == 1 && n == 1 && strcmp(trailing[0], "a") == 0);
+    char zeros[64];
+    fill(zeros, '0', 40);
+    check("all zeros is zero, not empty", ms_parse_hex_u64(zeros, true, &out) && out == 0);
+}
 
-    n = 0;
-    check("an empty list is handled", ms_strip_dashdash(&n, none) == 0 && n == 0);
+static void test_decimal_digit_limit(void) {
+    printf("\nCPython's 4300-digit ceiling on a decimal conversion\n");
+    /* Measured against the interpreter: the limit applies to base 10 and not to base 16,
+     * the count is every digit after the sign with leading zeros included, and an invalid
+     * character is reported ahead of it. */
+    char at_limit[MS_PY_INT_MAX_STR_DIGITS + 8];
+    fill(at_limit, '1', MS_PY_INT_MAX_STR_DIGITS);
+
+    char over_limit[MS_PY_INT_MAX_STR_DIGITS + 8];
+    fill(over_limit, '1', MS_PY_INT_MAX_STR_DIGITS + 1);
+
+    uint64_t out = 0;
+    MsIntOverflow overflow;
+    char err[256];
+
+    /* At the limit it is a number -- far too large for uint64_t, so it is reported as out
+     * of range rather than as an invalid literal. That distinction is the point. */
+    check("4300 digits is not a limit error",
+          !ms_parse_py_int(at_limit, 10, false, &out, &overflow, err, sizeof(err))
+          && strstr(err, "Exceeds the limit") == NULL);
+    check("4300 digits overflows instead", overflow.triggered);
+
+    check("4301 digits is a limit error",
+          !ms_parse_py_int(over_limit, 10, false, &out, &overflow, err, sizeof(err))
+          && strstr(err, "Exceeds the limit (4300 digits)") != NULL);
+    check("and it names the digit count",
+          strstr(err, "value has 4301 digits") != NULL);
+    check("and it does not claim an overflow", !overflow.triggered);
+
+    /* Base 16 has no such ceiling in CPython. */
+    check("4301 hex digits is not a limit error",
+          !ms_parse_py_int(over_limit, 16, false, &out, &overflow, err, sizeof(err))
+          && strstr(err, "Exceeds the limit") == NULL);
+
+    /* Leading zeros count toward the limit even though they are not significant. */
+    char padded[MS_PY_INT_MAX_STR_DIGITS + 108];
+    fill(padded, '0', 100);
+    fill(padded + 100, '1', MS_PY_INT_MAX_STR_DIGITS);
+    check("100 zeros plus 4300 digits is 4400 digits, over the limit",
+          !ms_parse_py_int(padded, 10, false, &out, &overflow, err, sizeof(err))
+          && strstr(err, "value has 4400 digits") != NULL);
+
+    /* An invalid character is reported before the limit is. */
+    char bad[MS_PY_INT_MAX_STR_DIGITS + 8];
+    fill(bad, '1', MS_PY_INT_MAX_STR_DIGITS + 1);
+    bad[MS_PY_INT_MAX_STR_DIGITS] = 'z';
+    check("a bad character outranks the limit",
+          !ms_parse_py_int(bad, 10, false, &out, &overflow, err, sizeof(err))
+          && strstr(err, "invalid literal") != NULL);
+}
+
+static void test_literal_repr_truncation(void) {
+    printf("\nCPython truncates the literal it quotes back\n");
+    /* CPython formats this message with "%.200R", so what it quotes is repr(literal) cut to
+     * 200 characters INCLUDING the quotes -- which is why a long literal keeps its opening
+     * quote and loses its closing one. Measured; it reads like a bug until you see it. */
+    char literal[512];
+    fill(literal, 'A', 300);
+
+    char shown[208];
+    ms_py_literal_repr(literal, shown, sizeof(shown));
+    check("the repr is cut to 200 characters", strlen(shown) == 200);
+    check("it keeps the opening quote", shown[0] == '\'');
+    check("and loses the closing one", shown[199] != '\'');
+
+    char shortish[64];
+    fill(shortish, 'A', 10);
+    ms_py_literal_repr(shortish, shown, sizeof(shown));
+    check("a short literal keeps both quotes",
+          strlen(shown) == 12 && shown[0] == '\'' && shown[11] == '\'');
+}
+
+static void test_canonical_decimal(void) {
+    printf("\nrendering a literal the way Python's \"%%d\" renders its int\n");
+    /* For the three error messages that echo a count or a length back: strtoll saturates and
+     * Python's int does not, so printing the parse quoted a number the user never typed. */
+    bool neg = true;
+    check("a plain literal is itself",
+          strcmp(ms_canonical_decimal("64", &neg), "64") == 0 && !neg);
+    check("a '+' is dropped",
+          strcmp(ms_canonical_decimal("+64", &neg), "64") == 0 && !neg);
+    check("leading zeros are dropped",
+          strcmp(ms_canonical_decimal("000064", &neg), "64") == 0 && !neg);
+    check("a '-' is reported, not returned",
+          strcmp(ms_canonical_decimal("-64", &neg), "64") == 0 && neg);
+    check("zero is zero", strcmp(ms_canonical_decimal("0", &neg), "0") == 0 && !neg);
+    check("and negative zero is still zero, as int(\"-0\") is",
+          strcmp(ms_canonical_decimal("-0", &neg), "0") == 0 && !neg);
+    check("all zeros collapse to one",
+          strcmp(ms_canonical_decimal("-0000", &neg), "0") == 0 && !neg);
+    check("a literal too large for int64_t survives whole",
+          strcmp(ms_canonical_decimal("11111111111111111111", &neg),
+                 "11111111111111111111") == 0 && !neg);
 }
 
 int main(void) {
@@ -149,7 +235,10 @@ int main(void) {
     test_plus_literal_accepted();
     test_overflow_rejected();
     test_double_sign_rejected();
-    test_strip_dashdash();
+    test_leading_zeros_are_not_digits();
+    test_decimal_digit_limit();
+    test_literal_repr_truncation();
+    test_canonical_decimal();
 
     printf("\n");
     if (failures) {
