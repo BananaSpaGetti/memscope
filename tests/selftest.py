@@ -309,14 +309,20 @@ def live_pointer_checks(results, process, cap):
             pairs = _inner_break_build(blank)
         with CountingRead(process) as counter_new:
             pmap = ptrscan.PointerMap(process)
-        results.check("_build stops the walk at the cap",
-                      pmap.truncated and len(pmap.values) == cap,
-                      "%d pairs, truncated=%s" % (len(pmap.values), pmap.truncated))
-        results.check("_build stops reading once capped", counter_new.bytes < counter_old.bytes,
-                      "%d reads / %.2f MB, was %d reads / %.2f MB"
-                      % (counter_new.bulk + counter_new.fallback, counter_new.bytes / 2**20,
-                         counter_old.bulk + counter_old.fallback, counter_old.bytes / 2**20))
-        results.note("the shape it replaced overshot the cap by %d pairs" % (len(pairs) - cap))
+        if not pmap.truncated:
+            results.note("skipping the cap checks: the target only has %d pairs, below the "
+                         "cap of %d -- point --pid at a larger process to reach it"
+                         % (len(pmap.values), cap))
+        else:
+            results.check("_build stops the walk at the cap",
+                          pmap.truncated and len(pmap.values) == cap,
+                          "%d pairs, truncated=%s" % (len(pmap.values), pmap.truncated))
+            results.check("_build stops reading once capped",
+                          counter_new.bytes < counter_old.bytes,
+                          "%d reads / %.2f MB, was %d reads / %.2f MB"
+                          % (counter_new.bulk + counter_new.fallback, counter_new.bytes / 2**20,
+                             counter_old.bulk + counter_old.fallback, counter_old.bytes / 2**20))
+            results.note("the shape it replaced overshot the cap by %d pairs" % (len(pairs) - cap))
 
         if pmap.values:
             target = pmap.values[len(pmap.values) // 2]

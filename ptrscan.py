@@ -210,13 +210,28 @@ def parse_path(text):
     return module_name, int(offset_hex, 16), [int(o, 16) for o in rest]
 
 
+def hex_offset(text):
+    """argparse type= for --offset: a bad value must be an argparse error, not a raw
+    ValueError -- by the time main() used to convert it by hand, the process was already
+    attached, so the uncaught traceback (and the machine's path inside it) reached stderr."""
+    try:
+        value = int(text, 16)
+    except ValueError:
+        raise argparse.ArgumentTypeError("invalid hex value: %r" % text)
+    # A negative offset used to pass straight through and print as "max offset 0x-1", which is
+    # not a number; the scan then matched nothing, silently. Reject it here instead.
+    if value < 0:
+        raise argparse.ArgumentTypeError("invalid hex value: %r" % text)
+    return value
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("target", help="pid or process name")
     parser.add_argument("address", nargs="?", help="the address to find paths to (hex)")
     parser.add_argument("--depth", type=int, default=3)
-    parser.add_argument("--offset", default="0x400", help="max offset per hop (hex)")
+    parser.add_argument("--offset", type=hex_offset, default="0x400", help="max offset per hop (hex)")
     parser.add_argument("--max", type=int, default=40, help="stop after this many paths")
     parser.add_argument("--resolve", help="a path string to follow and print the address of")
     args = parser.parse_args()
@@ -227,7 +242,11 @@ def main():
     module_list = modules(process.pid)
     try:
         if args.resolve:
-            module_name, module_offset, offsets = parse_path(args.resolve)
+            try:
+                module_name, module_offset, offsets = parse_path(args.resolve)
+            except ValueError:
+                print("ptrscan: could not parse path '%s'" % args.resolve, file=sys.stderr)
+                return 2
             address = resolve(process, module_name, module_offset, offsets, module_list)
             if address is None:
                 print("could not resolve (module not found or a hop read failed)")
@@ -239,8 +258,18 @@ def main():
         if not args.address:
             print("give an address to scan for, or --resolve a path")
             return 2
-        target = int(args.address, 16)
-        max_offset = int(args.offset, 16)
+        try:
+            target = int(args.address, 16)
+        except ValueError:
+            print("ptrscan: invalid address '%s'" % args.address, file=sys.stderr)
+            return 2
+        # int() has arbitrary precision; an address outside 0..2**64-1 names a location that
+        # cannot exist in a 64-bit process. The C port already rejects both directions here --
+        # this brings the Python in line rather than the other way around.
+        if not 0 <= target <= 0xFFFFFFFFFFFFFFFF:
+            print("ptrscan: invalid address '%s'" % args.address, file=sys.stderr)
+            return 2
+        max_offset = args.offset
         print("scanning for static pointer paths to 0x%X (depth %d, max offset 0x%X)..."
               % (target, args.depth, max_offset))
         results, pmap, dropped = find_paths(process, target, args.depth, max_offset,

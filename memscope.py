@@ -172,7 +172,14 @@ def resolve_type(name):
 def pack(value, kind):
     fmt, _ = TYPES[kind]
     number = float(value) if kind in ("float", "double") else int(value, 0) if isinstance(value, str) else value
-    return struct.pack(fmt, number)
+    try:
+        return struct.pack(fmt, number)
+    except struct.error as problem:
+        # struct.error names its own format character (e.g. 'i'), which means nothing to
+        # someone who typed a type name at the prompt. Swap in the type name they used,
+        # keeping the rest of the message -- and still a struct.error -- unchanged.
+        message = re.sub(r"^'.'", kind, str(problem))
+        raise struct.error(message) from problem
 
 
 def unpack(data, kind):
@@ -322,6 +329,17 @@ def attach(target):
         return None
 
 
+def repl_address(text):
+    """Parses a REPL address argument. int() has arbitrary precision, so an address wider than
+    64 bits converts happily and ctypes then truncates it modulo 2**64 -- `freeze` would report
+    freezing at the address typed while writing somewhere else entirely. No such address exists
+    in a 64-bit process. The message matches the C port's, since the REPL wrapper prints it."""
+    value = int(text, 16)
+    if not 0 <= value <= 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("int too large to convert: '%s'" % text)
+    return value
+
+
 def repl(scanner):
     print("attached to pid %d %s -- type help, or quit"
           % (scanner.process.pid, scanner.process.name))
@@ -402,7 +420,7 @@ def _dispatch(scanner, command, rest, frozen):
             if len(rest) < 2:
                 print("write <addr> <value>")
                 return
-            address = int(rest[0], 16)
+            address = repl_address(rest[0])
             before = unpack(scanner.process.read(address, TYPES[scanner.kind][1]) or b"", scanner.kind)
             payload = pack(rest[1], scanner.kind)
             answer = input("  0x%X is %s, write %s? [y/N] " % (address, before, rest[1]))
@@ -413,7 +431,7 @@ def _dispatch(scanner, command, rest, frozen):
             if len(rest) < 2:
                 print("freeze <addr> <value>   (blank line re-applies all freezes; `unfreeze` clears)")
                 return
-            address = int(rest[0], 16)
+            address = repl_address(rest[0])
             # Pack before recording: the blank-line replay below re-packs every frozen
             # entry outside the try, so storing a value that cannot pack turns one bad
             # argument into a crash on the next Enter, long after the command that caused it.
@@ -433,7 +451,7 @@ def _dispatch(scanner, command, rest, frozen):
             except ImportError:
                 print("ptrscan.py not found next to memscope.py")
                 return
-            target = int(rest[0], 16)
+            target = repl_address(rest[0])
             depth = int(rest[1]) if len(rest) > 1 else 3
             max_offset = int(rest[2], 16) if len(rest) > 2 else 0x400
             print("scanning for static pointer paths (depth %d, offset 0x%X)..."
@@ -485,12 +503,38 @@ def main():
         return 0
 
     if args.command == "read":
-        kind = resolve_type(args.type)
+        try:
+            kind = resolve_type(args.type)
+        except ValueError as problem:
+            print(problem, file=sys.stderr)
+            return 2
+        try:
+            address = int(args.address, 16)
+        except ValueError:
+            print("read: invalid address '%s'" % args.address, file=sys.stderr)
+            return 2
+        # int() has arbitrary precision, so an address outside 64 bits converts happily --
+        # too wide, and ctypes truncates it modulo 2**64; negative, and it is meaningless --
+        # and the read fails while the line printed names an address that was never touched.
+        # No such address exists in a 64-bit process; reject it, the way the C port does.
+        # A leading '-' is normally caught by argparse before this code ever runs (it looks
+        # like an unrecognized option, not a positional), but `--` forces it through.
+        if not 0 <= address <= 0xFFFFFFFFFFFFFFFF:
+            print("read: invalid address '%s'" % args.address, file=sys.stderr)
+            return 2
+        # A count this large never finishes -- each iteration is its own ReadProcessMemory
+        # call, so there is no single allocation to raise OverflowError the way dump's length
+        # does below, just a loop that runs for a duration nobody who typed a decimal literal
+        # this size (rather than picking a real range to read) intended. Reject before
+        # attaching, the same shape as every other argument check here.
+        if args.count > MAX_HITS:
+            print("read: count must not exceed %d: '%d'" % (MAX_HITS, args.count),
+                  file=sys.stderr)
+            return 2
         proc = attach(str(args.pid))
         if not proc:
             return 1
         _, size = TYPES[kind]
-        address = int(args.address, 16)
         for i in range(args.count):
             data = proc.read(address + i * size, size)
             print("  0x%X = %s" % (address + i * size, unpack(data, kind) if data else "<unreadable>"))
@@ -498,10 +542,36 @@ def main():
         return 0
 
     if args.command == "dump":
+        try:
+            address = int(args.address, 16)
+        except ValueError:
+            print("dump: invalid address '%s'" % args.address, file=sys.stderr)
+            return 2
+        # See read's identical check just above: an address outside 0..2**64-1 is
+        # meaningless, whichever direction it is out of range.
+        if not 0 <= address <= 0xFFFFFFFFFFFFFFFF:
+            print("dump: invalid address '%s'" % args.address, file=sys.stderr)
+            return 2
+        if args.length < 0:
+            # A negative length is meaningless -- there is nothing to dump backwards -- and it
+            # is exactly the input that used to reach ctypes.create_string_buffer(-1) and raise
+            # an uncaught ValueError, traceback and all. Reject it the same way argparse itself
+            # rejects a bad argument: one clean line to stderr, exit 2, before attaching. The C
+            # port currently treats a non-positive length as "print nothing" and exits 0 (see
+            # cmd_dump's `if (length > 0)`); it would need that changed to actually match this.
+            print("dump: length must not be negative: '%d'" % args.length, file=sys.stderr)
+            return 2
+        if args.length > MAX_SCAN_BYTES:
+            # A length this large reaches ctypes.create_string_buffer(size) with `size`
+            # too big for the C ssize_t it converts through -- an uncaught OverflowError,
+            # traceback and all, with this file's own path in it. Same class of leak as the
+            # negative case above; reject it the same way, before attaching.
+            print("dump: length must not exceed %d bytes: '%d'" % (MAX_SCAN_BYTES, args.length),
+                  file=sys.stderr)
+            return 2
         proc = attach(str(args.pid))
         if not proc:
             return 1
-        address = int(args.address, 16)
         data = proc.read(address, args.length) or b""
         for i in range(0, len(data), 16):
             chunk = data[i:i + 16]

@@ -7,10 +7,16 @@ let it change, scan again for what changed, until one address is left.
 
 Nothing in it is specific to any one program; it is a debugging and reverse-engineering tool.
 
+There are two implementations: the original, in one file of standard-library Python, and a
+native C port in `c/` that builds `memscope.exe` and `ptrscan.exe`. They behave the same --
+see "The C port" below for how that is checked.
+
 ## Requirements
 
 - Windows, 64-bit.
-- Python 3 (`py` on this machine). No third-party packages.
+- To run the Python: Python 3 (`py` on this machine). No third-party packages.
+- To run the C build: nothing -- `memscope.exe` and `ptrscan.exe` need no Python installed.
+  Building them from source needs a C compiler; see "The C port".
 - The right to open the target. A program you started runs at your integrity level and opens
   fine. Something running elevated, or a game with a higher integrity level, needs MemScope
   run from an **elevated terminal**, or `OpenProcess` fails with "access denied".
@@ -85,6 +91,71 @@ Or, inside the scanner, `pscan <addr>` runs it on the process already attached. 
 printed as `module+offset -> offset -> ...` and verified by resolving it back to the address.
 It reads every pointer-sized slot in the process once, so it is heavier than a value scan --
 start with a small depth and offset, and mind free RAM on a large target.
+
+## The C port
+
+`c/` holds a native C port of both tools, built with a plain `make`:
+
+```
+make -C c              builds c/memscope.exe and c/ptrscan.exe
+make -C c test          also builds and runs one test executable per file under c/tests/
+```
+
+A C compiler (gcc; a Makefile is provided, w64devkit works) must be on `PATH` to build it, but
+the resulting `.exe` files need no Python installed to run -- copy them anywhere on a 64-bit
+Windows machine. Their command line and output match the Python exactly, including `-h` /
+`--help` and every error path -- `c/tests/differential.py` is what checks that; see below.
+
+**The Python remains the reference implementation.** `c/tests/differential.py` runs both
+implementations on the same inputs -- process listing, reads and dumps across every type,
+scripted scanner sessions, pointer scans, `-h`/`--help`, and every error path -- across 116
+cases, and compares stdout, stderr and exit code separately for each. It also fails the run if
+either implementation ever prints a path from the machine it runs on. That is why the Python
+is still here even though the C build needs it for nothing at runtime: without it, the diffs
+that keep the port honest would have nothing to compare against.
+
+Diffing the two found twelve defects in the already-published Python, since a second independent
+implementation surfaces things a single one's own tests do not:
+
+- an unknown `--type` printed an unhandled traceback instead of an error message;
+- a malformed address given to `read` or `dump` printed an unhandled traceback instead of an
+  error message;
+- an out-of-range value for a type named the `struct` module's internal format character
+  (e.g. `'i'`) instead of the type name the user actually typed;
+- `tests/selftest.py`'s live pointer-map checks forced the cap down and asserted the map
+  truncated without checking the target was even large enough to reach that cap, so a small
+  target failed two checks that had nothing wrong with them;
+- `ptrscan.py`'s bad `--offset` printed an unhandled traceback carrying this machine's
+  absolute path;
+- `memscope.py`'s unknown-type error went to stdout with exit code 1, while its own
+  malformed-address error went to stderr with exit code 2; both now go to stderr with exit
+  code 2, and the C follows;
+- `ptrscan.py`'s address argument and its `--resolve` path were both converted by hand after
+  the process had been attached, so a bad one printed an unhandled traceback -- again carrying
+  this machine's absolute path;
+- `memscope.py`'s `dump` with a negative length reached `ctypes.create_string_buffer` and
+  raised, traceback and all;
+- an address outside 0..2**64-1, in either direction, was accepted by `read`, `dump` and the
+  REPL's `freeze`, `write` and `pscan`: `int()` has arbitrary precision, `ctypes` then
+  truncated a too-wide one modulo 2**64, and the line printed named an address nothing had
+  touched -- while a negative one (reachable only through argparse's `--` separator) was
+  simply never checked at all. No such address exists in a 64-bit process, and `freeze` writes
+  memory repeatedly;
+- `ptrscan.py`'s `--offset` accepted a negative value and printed it as `max offset 0x-1`,
+  which is not a number;
+- `ptrscan.py`'s own address argument had no range check of any kind, unlike `--offset`
+  alongside it or `read`/`dump`'s identical argument in the other file;
+- `memscope.py`'s `dump` and `read` accepted an astronomically large positive length or
+  count: `dump` reached `ctypes.create_string_buffer(size)` with `size` too big for the
+  index-sized integer it converts through and raised `OverflowError`, traceback and this
+  file's own path in it; `read`'s `--count` had no single allocation to overflow, just a
+  loop that would run, one real `ReadProcessMemory` call per iteration, for a duration
+  nobody who typed a literal that size intended.
+
+All twelve are fixed in this repository's Python. Four code reviews found them; the harness
+had reported "all cases match" through all four, because it covered none of the cases
+involved each time. Every one of them is now a case in it -- which is the only reason that
+sentence above about matching exactly is worth anything.
 
 ## Tests
 
