@@ -132,7 +132,13 @@ static void add_decimal(const char *magnitude, uint64_t add, char *out, size_t o
  * which keeps the type at freeze time rather than the scanner's current type. */
 typedef struct {
     uint64_t address;
-    char literal[64];
+    /* Owned, and heap-allocated because memscope.py stores the string itself and a Python
+     * string has no length. This was `char literal[64]`, which snprintf truncated in
+     * silence: `freeze <addr> 0.<62 zeros>1234` wrote the right value once and then a
+     * DIFFERENT value on every re-apply, because what got replayed was a 63-character
+     * prefix of what the user typed. The REPL reads its input line with no length limit,
+     * so there is no bound here that could be called safe. */
+    char *literal;
     MsType kind;
 } FrozenWrite;
 
@@ -146,9 +152,20 @@ typedef struct {
  * present keeps its position and only its literal/kind change. Returns false, leaving `fs`
  * unchanged, if growing the array failed -- the way ptrmap.c's append_pair reports it. */
 static bool frozen_set(FrozenSet *fs, uint64_t address, const char *literal, MsType kind) {
+    /* Copied before anything is modified, so a failed allocation leaves `fs` exactly as it
+     * was -- including the entry being overwritten below, which must not be left holding a
+     * freed pointer. */
+    size_t size = strlen(literal) + 1;
+    char *copy = (char *)malloc(size);
+    if (!copy) {
+        return false;
+    }
+    memcpy(copy, literal, size);
+
     for (size_t i = 0; i < fs->count; i++) {
         if (fs->items[i].address == address) {
-            snprintf(fs->items[i].literal, sizeof(fs->items[i].literal), "%s", literal);
+            free(fs->items[i].literal);
+            fs->items[i].literal = copy;
             fs->items[i].kind = kind;
             return true;
         }
@@ -157,6 +174,7 @@ static bool frozen_set(FrozenSet *fs, uint64_t address, const char *literal, MsT
         size_t new_capacity = fs->capacity ? fs->capacity * 2 : 8;
         FrozenWrite *grown = (FrozenWrite *)realloc(fs->items, new_capacity * sizeof(FrozenWrite));
         if (!grown) {
+            free(copy);
             return false;
         }
         fs->items = grown;
@@ -164,12 +182,16 @@ static bool frozen_set(FrozenSet *fs, uint64_t address, const char *literal, MsT
     }
     FrozenWrite *entry = &fs->items[fs->count++];
     entry->address = address;
-    snprintf(entry->literal, sizeof(entry->literal), "%s", literal);
+    entry->literal = copy;
     entry->kind = kind;
     return true;
 }
 
 static void frozen_clear(FrozenSet *fs) {
+    for (size_t i = 0; i < fs->count; i++) {
+        free(fs->items[i].literal);
+        fs->items[i].literal = NULL;
+    }
     fs->count = 0;
 }
 
@@ -178,7 +200,13 @@ static void frozen_clear(FrozenSet *fs) {
  * kind))`. A literal that no longer packs under its own recorded type cannot happen (it was
  * proven to pack at freeze time and neither the literal nor the type is ever changed after
  * that), so failures here are silently skipped rather than reported, the same as Python
- * simply not raising in that path. */
+ * simply not raising in that path.
+ *
+ * That premise used to be false, and this silence is what hid it: the stored literal WAS
+ * changed after freeze time, by a fixed 64-byte copy that truncated it. A truncated numeric
+ * literal usually still packs, so nothing failed and nothing was skipped -- a different
+ * value was simply written, for as long as the freeze was held. The literal is owned and
+ * unbounded now, which is what makes the premise true. */
 static void frozen_reapply(FrozenSet *fs, ProcessIO *process) {
     for (size_t i = 0; i < fs->count; i++) {
         uint8_t payload[MS_MAX_VALUE_SIZE];
@@ -806,6 +834,7 @@ static void repl_loop(Scanner *scanner, unsigned long pid, const char *name) {
         free(line);
     }
 
+    frozen_clear(&frozen);   /* each entry owns its literal */
     free(frozen.items);
 }
 

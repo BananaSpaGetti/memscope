@@ -320,41 +320,61 @@ static bool pack_float(const char *literal, MsType kind, uint8_t *out,
         set_err(err, err_cap, "could not convert string to float: '%s'", literal);
         return false;
     }
+    /* A trimmed, NUL-terminated copy, because strtod's end-pointer check below cannot tell
+     * trailing whitespace from trailing garbage. Python's float() has no length limit --
+     * float("0." + "0" * 294 + "1234") is 1.234e-295, and a thousand zeros is 0.0 -- so a
+     * literal too long for the stack buffer is allocated rather than refused. It used to be
+     * refused, which made `freeze <addr> <a 300-character literal>` fail here and leave the
+     * address holding its old value while memscope.py froze it. Unlike int()'s message,
+     * float()'s quotes the literal in full: measured, no truncation. */
     size_t len = (size_t)(end - start);
-    if (len >= LIT_BUF_SIZE) {
-        set_err(err, err_cap, "could not convert string to float: '%s'", literal);
-        return false;
+    char stack_buf[LIT_BUF_SIZE];
+    char *buf = stack_buf;
+    if (len >= sizeof(stack_buf)) {
+        buf = (char *)malloc(len + 1);
+        if (!buf) {
+            set_err(err, err_cap, "could not convert string to float: '%s'", literal);
+            return false;
+        }
     }
-    char buf[LIT_BUF_SIZE];
     memcpy(buf, start, len);
     buf[len] = '\0';
 
-    /* strtod accepts C99 hex-float literals ("0x10", "0x1.8p3") that Python's float()
-     * rejects outright; reject them by hand before strtod gets a chance to parse one. */
-    const char *digits = buf;
-    if (*digits == '+' || *digits == '-') {
-        digits++;
-    }
-    if (digits[0] == '0' && (digits[1] == 'x' || digits[1] == 'X')) {
-        set_err(err, err_cap, "could not convert string to float: '%s'", literal);
-        return false;
-    }
+    bool ok = false;
+    do {
+        /* strtod accepts C99 hex-float literals ("0x10", "0x1.8p3") that Python's float()
+         * rejects outright; reject them by hand before strtod gets a chance to parse one. */
+        const char *digits = buf;
+        if (*digits == '+' || *digits == '-') {
+            digits++;
+        }
+        if (digits[0] == '0' && (digits[1] == 'x' || digits[1] == 'X')) {
+            break;
+        }
 
-    char *endp;
-    errno = 0;
-    double value = strtod(buf, &endp);
-    if (endp == buf || *endp != '\0') {
-        set_err(err, err_cap, "could not convert string to float: '%s'", literal);
-        return false;
-    }
+        char *endp;
+        errno = 0;
+        double value = strtod(buf, &endp);
+        if (endp == buf || *endp != '\0') {
+            break;
+        }
 
-    if (kind == MS_TYPE_FLOAT) {
-        float f = (float)value;
-        memcpy(out, &f, sizeof(f));
-    } else {
-        memcpy(out, &value, sizeof(value));
+        if (kind == MS_TYPE_FLOAT) {
+            float f = (float)value;
+            memcpy(out, &f, sizeof(f));
+        } else {
+            memcpy(out, &value, sizeof(value));
+        }
+        ok = true;
+    } while (0);
+
+    if (buf != stack_buf) {
+        free(buf);
     }
-    return true;
+    if (!ok) {
+        set_err(err, err_cap, "could not convert string to float: '%s'", literal);
+    }
+    return ok;
 }
 
 bool ms_pack(const char *literal, MsType kind, uint8_t *out, size_t *out_len,

@@ -9,8 +9,12 @@ padded with a leading space, a trailing space, a tab and a carriage return, and 
 `--count`; `dump` at several lengths and boundary addresses, an unreadable address, a malformed
 address and a non-numeric length; a scripted REPL session exercising type, scan (an exact
 match, leading-zero decimal literals, a float scan of a hex string, and a literal above
-2**64), next same/changed, list (including an enormous count), freeze (an unpackable literal,
-an out-of-range value, and a negative value into an unsigned type), unfreeze, pscan (a bad
+2**64), next same/changed, list (including an enormous count, and the 2**63..2**64 window
+where a magnitude that fits uint64_t but not int64_t once flipped sign), a sign after a base
+prefix (`0x-5`, which int(x, 0) refuses), freeze (an unpackable literal, an out-of-range
+value, a negative value into an unsigned type, and two literals longer than the buffers that
+used to hold them -- each re-applied and then scanned for, since a re-apply prints nothing
+and cannot otherwise be checked), unfreeze, pscan (a bad
 depth and a bad max offset), a bad command, reset and quit; `ptrscan` with no address (exit
 2), with no arguments at all, with `--depth 1` and `--depth 2`, with a bad `--depth`, `--max`
 and `--offset`, and a `--resolve` round trip in both directions; and `--help`/`-h` at the top
@@ -332,6 +336,12 @@ def test_dump(pid, addrs):
 def test_repl(pid, addrs):
     addr = "0x%X" % addrs["uint8"]
     leaf = "0x%X" % addrs["leaf"]
+    double_addr = "0x%X" % addrs["double"]
+    # 68 characters, which is what a 64-byte store truncated. Chosen so the truncated prefix
+    # still parses as a number -- that is what made the old bug silent rather than an error.
+    long_double = "0." + "0" * 62 + "1234"
+    # Past any fixed buffer in the float path, where the literal was refused outright.
+    longer_double = "0." + "0" * 294 + "1234"
     script = "\n".join([
         "type int32",
         "scan 74123698",              # g_scan_target's exact value -- an exact first scan
@@ -344,6 +354,16 @@ def test_repl(pid, addrs):
         # flip sign on the way into the counter, so this listed candidates instead of none
         # and reported a tally of 7335632962598440506.
         "list -11111111111111111111",
+        "list 10000000000000000000",  # the low end of the same window, reported separately
+        # A sign after the base prefix. int(x, 0) raises for every one of these; the old
+        # hand-rolled parser handed the rest of the literal to strtoull, which took the sign
+        # itself -- so `write <addr> 0x-5` offered to write -5 where memscope.py refuses.
+        "scan 0x-5",
+        "scan 0b-1",
+        "scan 0o-7",
+        "scan 0x 5",
+        "scan - 5",
+        "write %s 0x-5" % addr,
         "list 11111111111111111111",
         # Long literals: CPython's 4300-digit ceiling applies to these decimal conversions,
         # and the tally printed for a negative count is arbitrary-precision arithmetic on
@@ -366,6 +386,27 @@ def test_repl(pid, addrs):
         "freeze %s 99999" % addr,     # out of range for uint8 -- never recorded
         "freeze %s -1" % addr,        # negative into an unsigned type -- never recorded
         "unfreeze",
+        # A frozen literal LONGER than the store that held it. Every freeze case above fails
+        # to pack, so none of them ever reaches the line that records the literal, and the
+        # re-apply that replays it prints nothing at all -- so no amount of comparing stdout
+        # after a freeze could see the value going wrong. This makes it visible: the literal
+        # is replayed, then searched for. A 64-byte store truncated it to 63 characters, so
+        # the first write was right and every re-apply wrote a different number; the scan
+        # that follows then found nothing where memscope.py finds the address.
+        "type double",
+        "freeze %s %s" % (double_addr, long_double),
+        "",                           # a blank line re-applies every frozen write
+        "unfreeze",
+        "scan %s" % long_double,      # finds the address only if the re-apply was faithful
+        "list 3",
+        # The same, past the float path's own fixed buffer, which refused the literal rather
+        # than truncating it -- so the freeze failed here and held the old value while
+        # memscope.py froze the address. float() has no length limit.
+        "freeze %s %s" % (double_addr, longer_double),
+        "",
+        "unfreeze",
+        "scan %s" % longer_double,
+        "list 3",
         "pscan %s abc" % addr,        # a bad depth -- non-numeric, must not traceback
         "pscan %s 2 zzz" % addr,      # a bad max offset -- non-hex, must not traceback
         # Found by the second review. An address wider than 64 bits must be reported, never
