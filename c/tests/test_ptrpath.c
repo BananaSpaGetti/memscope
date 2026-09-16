@@ -269,10 +269,80 @@ static void test_round_trip(void) {
     check("a path with no '+' is rejected, not crashed on", !ok, NULL);
 }
 
+/* Where an over-wide hex piece sits, which decides whether the resolve that follows is a real
+ * failure or the one divergence ptrpath.h documents.
+ *
+ * This lives here and not in the differential harness because that harness cannot hold it:
+ * for the final-piece case the two implementations are SUPPOSED to disagree -- ptrscan.py
+ * prints an address wider than 64 bits and this port cannot represent one. Until the position
+ * was reported, that case printed "could not resolve (module not found or a hop read
+ * failed)", which names two causes that are both false there and is byte-identical to what a
+ * misspelled module name prints. A documented limitation indistinguishable from a typo is
+ * also one nothing can test; this is what makes it testable. */
+static void test_oversized_piece_position(void) {
+    printf("\nwhere an over-wide hex piece sits\n");
+    const char *huge = "0xFFFFFFFFFFFFFFFFFF";   /* a valid literal, far past uint64_t */
+    char module_name[64];
+    uint64_t module_offset = 0;
+    uint64_t offsets[8];
+    int offset_count = 0;
+    int oversized_at = -1;
+    char path[256];
+
+    check("nothing over-wide reports -1",
+          ptrpath_parse("game.exe+0x10 -> 0x8", module_name, sizeof(module_name),
+                         &module_offset, offsets, 8, &offset_count, &oversized_at)
+          && oversized_at == -1, NULL);
+
+    oversized_at = -1;
+    snprintf(path, sizeof(path), "game.exe+%s", huge);
+    check("an over-wide module offset with no hops is position 0, the final piece",
+          ptrpath_parse(path, module_name, sizeof(module_name), &module_offset, offsets, 8,
+                         &offset_count, &oversized_at)
+          && oversized_at == 0 && offset_count == 0, NULL);
+
+    oversized_at = -1;
+    snprintf(path, sizeof(path), "game.exe+0x10 -> %s", huge);
+    check("an over-wide last hop is position 1 of 1, the final piece",
+          ptrpath_parse(path, module_name, sizeof(module_name), &module_offset, offsets, 8,
+                         &offset_count, &oversized_at)
+          && oversized_at == 1 && offset_count == 1, NULL);
+
+    oversized_at = -1;
+    snprintf(path, sizeof(path), "game.exe+0x10 -> %s -> 0x8", huge);
+    check("an over-wide EARLIER hop is position 1 of 2, so its address is read and the "
+          "resolve really does fail",
+          ptrpath_parse(path, module_name, sizeof(module_name), &module_offset, offsets, 8,
+                         &offset_count, &oversized_at)
+          && oversized_at == 1 && offset_count == 2, NULL);
+
+    oversized_at = -1;
+    snprintf(path, sizeof(path), "game.exe+%s -> 0x8", huge);
+    check("an over-wide module offset WITH a hop is position 0 of 1, also read",
+          ptrpath_parse(path, module_name, sizeof(module_name), &module_offset, offsets, 8,
+                         &offset_count, &oversized_at)
+          && oversized_at == 0 && offset_count == 1, NULL);
+
+    /* Only the first is recorded: it is the one that decides what happens. */
+    oversized_at = -1;
+    snprintf(path, sizeof(path), "game.exe+%s -> %s", huge, huge);
+    check("two over-wide pieces report the first",
+          ptrpath_parse(path, module_name, sizeof(module_name), &module_offset, offsets, 8,
+                         &offset_count, &oversized_at) && oversized_at == 0, NULL);
+
+    /* An over-wide piece is a valid literal, never a parse failure -- ptrscan.py's int() has
+     * no width, so refusing it here would turn a resolve failure into a parse error. */
+    oversized_at = -1;
+    check("a MALFORMED piece is still a parse failure",
+          !ptrpath_parse("game.exe+0x10 -> zzz", module_name, sizeof(module_name),
+                          &module_offset, offsets, 8, &offset_count, &oversized_at), NULL);
+}
+
 int main(void) {
     test_frontier_cap_exact();
     test_multilevel_path_and_resolve();
     test_round_trip();
+    test_oversized_piece_position();
 
     printf("\n");
     if (failures) {

@@ -351,16 +351,24 @@ static void trim(char *s) {
  * read the address it produces. Rejecting it here made a failed resolve (exit 1) into a
  * parse error (exit 2) with a different message.
  *
- * Out-of-range is therefore not a failure here; it is reported through *oversized, and the
- * caller treats such a path as one that cannot resolve -- which is what ptrscan.py does with
- * it, since an address that wide satisfies no read. Only a malformed literal fails. */
-static bool parse_path_offset(const char *text, uint64_t *out, bool *oversized) {
+ * Out-of-range is therefore not a failure here; it is reported through *oversized_at, which
+ * records WHERE it happened, because that decides what the caller can honestly say. Every
+ * address in a path is read except the last one: ptrscan.py reads base+module_offset, then
+ * each hop's result, and the final addition is returned unread. So an oversized piece
+ * anywhere but the end produces an address that fails to read in BOTH implementations and is
+ * a genuine "could not resolve" -- while an oversized piece at the end is an address
+ * ptrscan.py prints, wider than 64 bits, and this port cannot represent at all. Reporting
+ * those two as the same thing is what made a deliberate limitation indistinguishable from a
+ * misspelled module name. Only a malformed literal fails here. */
+static bool parse_path_offset(const char *text, uint64_t *out, int position, int *oversized_at) {
     MsIntOverflow overflow;
     if (ms_parse_py_int(text, 16, false, out, &overflow, NULL, 0)) {
         return true;
     }
     if (overflow.triggered) {
-        *oversized = true;
+        if (*oversized_at < 0) {
+            *oversized_at = position;   /* the first one decides the message */
+        }
         *out = 0;
         return true;
     }
@@ -369,7 +377,7 @@ static bool parse_path_offset(const char *text, uint64_t *out, bool *oversized) 
 
 bool ptrpath_parse(const char *text, char *module_name_out, size_t module_name_cap,
                     uint64_t *module_offset_out, uint64_t *offsets_out, size_t offsets_cap,
-                    int *offset_count_out, bool *oversized_out) {
+                    int *offset_count_out, int *oversized_at_out) {
     char buf[2048];
     size_t len = strlen(text);
     if (len >= sizeof(buf)) {
@@ -408,16 +416,17 @@ bool ptrpath_parse(const char *text, char *module_name_out, size_t module_name_c
     trim(module_name);
     trim(offset_hex);
 
-    bool oversized = false;
+    /* Position 0 is the module offset; position i is the i'th hop. -1 is "none oversized". */
+    int oversized_at = -1;
     uint64_t module_offset;
-    if (!parse_path_offset(offset_hex, &module_offset, &oversized)) {
+    if (!parse_path_offset(offset_hex, &module_offset, 0, &oversized_at)) {
         return false;
     }
 
     int offset_count = piece_count - 1;
     uint64_t parsed_offsets[PTRPATH_PARSE_MAX_PIECES];
     for (int i = 0; i < offset_count; i++) {
-        if (!parse_path_offset(pieces[1 + i], &parsed_offsets[i], &oversized)) {
+        if (!parse_path_offset(pieces[1 + i], &parsed_offsets[i], i + 1, &oversized_at)) {
             return false;
         }
     }
@@ -433,8 +442,8 @@ bool ptrpath_parse(const char *text, char *module_name_out, size_t module_name_c
     for (size_t i = 0; i < n; i++) {
         offsets_out[i] = parsed_offsets[i];
     }
-    if (oversized_out) {
-        *oversized_out = oversized;
+    if (oversized_at_out) {
+        *oversized_at_out = oversized_at;
     }
     if (offset_count_out) {
         *offset_count_out = offset_count;

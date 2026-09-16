@@ -81,10 +81,18 @@ int ptrpath_format(const char *module_name, uint64_t module_offset,
 /* One divergence from ptrscan.py is deliberate and cannot be closed without arbitrary-
  * precision addresses: if the LAST hop's offset carries the final address past 2**64, that
  * address is never read -- resolve() returns it and the caller prints it -- so ptrscan.py
- * prints a number wider than 64 bits, and this reports the path as unresolvable instead.
- * Every earlier hop IS exact, because its address is read before the next offset is added,
- * and a read of an address that wide fails in both implementations. Measured, recorded here
- * rather than left for the next reader to discover. */
+ * prints a number wider than 64 bits, which this port cannot represent. Every earlier hop IS
+ * exact, because its address is read before the next offset is added, and a read of an
+ * address that wide fails in both implementations. Measured, recorded here rather than left
+ * for the next reader to discover.
+ *
+ * What the caller may NOT do is report that as "could not resolve". It did, and the two
+ * causes that message names -- a missing module, a failed hop read -- are both false there:
+ * the module is found and every hop reads. It was also byte-identical to what a misspelled
+ * module name prints, so the one case documented here as a deliberate limit was
+ * indistinguishable from a typo, and untestable besides. `oversized_at_out` exists so the
+ * caller can say which piece left the address space, which costs no arbitrary precision and
+ * turns a wrong answer into an accurate refusal. */
 /* Parses "module+0xOFF -> 0xOFF -> 0xOFF", matching ptrscan.py's parse_path(): split on
  * "->", strip each piece, partition the first piece on "+". Every hex number is parsed
  * base 16 with an optional "0x"/"0X" prefix (matching Python's `int(s, 16)`, which is
@@ -99,12 +107,21 @@ int ptrpath_format(const char *module_name, uint64_t module_offset,
  * exceed `offsets_cap`, mirroring the out-array convention used elsewhere in this
  * codebase). Returns false, leaving every output untouched, if the text cannot be
  * parsed or names more hops than this parser's internal bound allows. */
-/* *oversized_out reports a piece that is a valid hex literal but too wide for uint64_t --
- * ptrscan.py parses one (a Python int has no width) and then fails to resolve it, so the
- * caller must treat it as an unresolvable path rather than a malformed one. May be NULL. */
+/* *oversized_at_out reports WHERE a piece was a valid hex literal but too wide for uint64_t:
+ * -1 for none, 0 for the module offset, and N for the N'th hop. ptrscan.py parses such a
+ * piece (a Python int has no width), so it is never a malformed path -- but where it sits
+ * decides what actually happens, and therefore what may honestly be reported:
+ *
+ *   - anywhere but the final piece: the address it produces is READ, and a read that wide
+ *     fails in both implementations. A genuine "could not resolve"; nothing diverges.
+ *   - the final piece (the last hop, or the module offset when there are no hops): the
+ *     address is returned unread, so ptrscan.py prints a number wider than 64 bits. That is
+ *     the divergence above, and it must be reported as itself.
+ *
+ * Only the first oversized piece is recorded; it is the one that decides. May be NULL. */
 bool ptrpath_parse(const char *text, char *module_name_out, size_t module_name_cap,
                     uint64_t *module_offset_out, uint64_t *offsets_out, size_t offsets_cap,
-                    int *offset_count_out, bool *oversized_out);
+                    int *offset_count_out, int *oversized_at_out);
 
 #define PTRPATH_LIMIT_LINE_MAX 128
 

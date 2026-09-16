@@ -645,6 +645,18 @@ def test_parser_errors(pid, addrs):
     long_hex = "0x" + "f" * 200
     compare("memscope read an address of 200 hex digits",
             py_memscope("read", pid, long_hex), c_memscope("read", pid, long_hex))
+    # An over-wide hop offset BEFORE the final piece. ptrscan.py parses it (its int has no
+    # width), computes an address past 2**64, and fails to read it -- so both implementations
+    # answer "could not resolve", and that answer is now reached for the same reason rather
+    # than by a blanket refusal. The final-piece case is deliberately NOT here: there the two
+    # are supposed to disagree, and it is pinned in test_ptrpath.c instead.
+    huge_hop = "0x" + "F" * 18
+    compare("ptrscan --resolve, over-wide offset before the last hop",
+            py_ptrscan(pid, addr, "--resolve", "nosuch.dll+0x10 -> %s -> 0x8" % huge_hop),
+            c_ptrscan(pid, addr, "--resolve", "nosuch.dll+0x10 -> %s -> 0x8" % huge_hop))
+    compare("ptrscan --resolve, over-wide module offset with a hop after it",
+            py_ptrscan(pid, addr, "--resolve", "nosuch.dll+%s -> 0x8" % huge_hop),
+            c_ptrscan(pid, addr, "--resolve", "nosuch.dll+%s -> 0x8" % huge_hop))
     compare("ptrscan --resolve with a 200-digit hop offset",
             py_ptrscan(pid, addr, "--resolve", "a+" + long_hex),
             c_ptrscan(pid, addr, "--resolve", "a+" + long_hex))

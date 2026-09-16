@@ -246,21 +246,56 @@ int main(int argc, char **argv) {
         uint64_t module_offset;
         uint64_t offsets[256];
         int offset_count;
-        bool oversized = false;
+        int oversized_at = -1;
         if (!ptrpath_parse(resolve_str, module_name, sizeof(module_name), &module_offset,
                             offsets, sizeof(offsets) / sizeof(offsets[0]), &offset_count,
-                            &oversized) ||
+                            &oversized_at) ||
+            /* ptrpath_parse's contract allows *offset_count_out to exceed offsets_cap (it
+             * reports what it found, not what it stored), so the caller has to check. It
+             * cannot fire today only because this array and the parser's internal piece
+             * bound are both 256 -- change either and it starts mattering, which is why it
+             * stays rather than being pruned as dead. */
             offset_count > (int)(sizeof(offsets) / sizeof(offsets[0]))) {
             fprintf(stderr, "ptrscan: could not parse path '%s'\n", resolve_str);
             result = 2;
         } else {
             uint64_t address;
-            /* An offset too wide for uint64_t is a valid literal to ptrscan.py -- it parses
-             * it and only then fails to read the address it lands on. So it is not a parse
-             * error here either: it is a path that cannot resolve. */
-            if (oversized ||
-                !ptrpath_resolve(&io, module_name, module_offset, offsets, offset_count,
-                                  modules, module_count, &address)) {
+            /* An offset too wide for uint64_t is a valid literal to ptrscan.py, which parses
+             * it and carries on. Where it sits decides what happens, so it decides what can
+             * be said: every address in a path is read except the last, so an oversized piece
+             * before the end produces a read that fails in both implementations -- a real
+             * "could not resolve" -- while one AT the end is an address ptrscan.py prints,
+             * wider than 64 bits and not representable here.
+             *
+             * Reporting the second as the first was wrong twice over: both causes that
+             * message names are false (the module is found, every hop reads), and it is
+             * exactly what a misspelled module name prints, so a documented limitation was
+             * indistinguishable from a typo. */
+            bool resolved = ptrpath_resolve(&io, module_name, module_offset, offsets,
+                                             offset_count, modules, module_count, &address);
+            if (!resolved) {
+                /* Checked FIRST, because ptrscan.py checks it first: resolve() looks the
+                 * module up before it does any arithmetic, so a missing module answers even
+                 * a path whose offsets are nonsense. Reporting the overflow ahead of this
+                 * made `--resolve "nosuch.dll+0x10 -> <over-wide>"` blame the width when
+                 * Python blames the module. */
+                printf("could not resolve (module not found or a hop read failed)\n");
+                result = 1;
+            } else if (oversized_at >= 0 && oversized_at == offset_count) {
+                if (offset_count == 0) {
+                    printf("the module offset leaves the 64-bit address space; "
+                           "ptrscan.py would print an address wider than 64 bits\n");
+                } else {
+                    printf("hop %d leaves the 64-bit address space; "
+                           "ptrscan.py would print an address wider than 64 bits\n",
+                           offset_count);
+                }
+                result = 1;
+            } else if (oversized_at >= 0) {
+                /* An over-wide piece before the end: ptrscan.py carries it into an address
+                 * no read can satisfy, so the resolve fails there. It is parsed as 0 here,
+                 * which can land somewhere readable, so the failure is forced rather than
+                 * left to chance. */
                 printf("could not resolve (module not found or a hop read failed)\n");
                 result = 1;
             } else {
