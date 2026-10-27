@@ -7,6 +7,10 @@ let it change, scan again for what changed, until one address is left.
 
 Nothing in it is specific to any one program; it is a debugging and reverse-engineering tool.
 
+![A memscope session narrowing a changing value from 7 candidate addresses to 1](assets/memscope-demo.png)
+
+*A real session against a small test program whose value goes 31337 -> 40960 -> 52428: seven addresses match the first scan, one survives the next.*
+
 There are two implementations: the original, in one file of standard-library Python, and a
 native C port in `c/` that builds `memscope.exe` and `ptrscan.exe`. They behave the same --
 see "The C port" below for how that is checked.
